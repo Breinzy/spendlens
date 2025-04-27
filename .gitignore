@@ -1,0 +1,34 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+*.pyenv
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE specific files (PyCharm)
+.idea/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Local settings or sensitive files (if any)
+# local_settings.py
+# .env
+
+# Data Files (IMPORTANT: Decide if you want to commit your CSVs)
+# If your CSV files contain real/sensitive financial data,
+# or are very large, it's best to ignore them.
+# Uncomment the line below to ignore ALL files in the data directory
+# data/
+# Or ignore only CSV files within data:
+data/*.csv
+
+# Operating System generated files
+.DS_Store
+Thumbs.db
