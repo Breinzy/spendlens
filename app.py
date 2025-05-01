@@ -1,377 +1,645 @@
 import os
-import json
 import logging
-from pathlib import Path
-from werkzeug.exceptions import NotFound, BadRequest
+from flask import Flask, request, jsonify, render_template, redirect, url_for, send_from_directory
+from werkzeug.utils import secure_filename
 import datetime as dt
 from dateutil.relativedelta import relativedelta
-import re # Import regex for parsing query
-from flask import Flask, request, jsonify, abort
-from werkzeug.utils import secure_filename
-from decimal import Decimal
-from dotenv import load_dotenv
+from decimal import Decimal, InvalidOperation
+from typing import Optional, List, Dict, Any # <--- Added import for Optional and other types
 
-# Load .env file right after imports
-load_dotenv()
+# Local imports (assuming they are in the same directory or accessible via PYTHONPATH)
+import database
+import parser
+import insights
+import llm_service # Assuming llm_service.py exists
+from config import Config # Assuming config.py exists
 
-# Imports
-from parser import Transaction, parse_checking_csv, parse_credit_csv
-from insights import (
-    calculate_summary_insights,
-    calculate_monthly_trends,
-    identify_recurring_transactions,
-    analyze_frequent_spending,
-    find_potential_duplicate_recurring
-)
-from database import (
-    init_db, add_transactions, get_all_transactions,
-    update_transaction_category, save_user_rule,
-    get_transaction_by_id, DATABASE_FILE
-)
-from llm_service import generate_financial_summary, answer_financial_question
-
-# Configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [APP] %(message)s')
+# --- Flask App Setup ---
 app = Flask(__name__)
-UPLOAD_FOLDER = 'uploads'; ALLOWED_EXTENSIONS = {'csv'}
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-Path(UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
+app.config.from_object(Config) # Load config from config.py
 
-# Helpers
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-class DecimalEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, Decimal): return str(obj)
-        if obj == float('inf'): return "Infinity"
-        if obj == float('-inf'): return "-Infinity"
-        if isinstance(obj, dt.date): return obj.isoformat()
-        return super(DecimalEncoder, self).default(obj)
-app.json_encoder = DecimalEncoder
+# Configure logging to match other modules
+log = logging.getLogger('app') # Use specific logger name
+log.setLevel(logging.INFO)
+if not log.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(name)s] - %(message)s')
+    handler.setFormatter(formatter)
+    log.addHandler(handler)
 
-# --- Flask Routes ---
-# (Previous routes remain unchanged)
+# Ensure upload folder exists
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
+    log.info(f"Created upload folder: {app.config['UPLOAD_FOLDER']}")
+
+# --- Database Initialization ---
+# Ensure the database and table exist when the app starts
+try:
+    database.initialize_database()
+except Exception as e:
+    log.critical(f"Failed to initialize database on startup: {e}", exc_info=True)
+    # Depending on the desired behavior, you might exit or continue with limited functionality
+    # exit(1) # Uncomment to exit if DB initialization fails
+
+# --- Helper Functions ---
+def allowed_file(filename: str) -> bool:
+    """Checks if the uploaded file has an allowed extension."""
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+# --- CORRECTED FUNCTION SIGNATURE ---
+def parse_date_param(date_str: Optional[str], default: Optional[dt.date]) -> Optional[dt.date]:
+# --- END CORRECTION ---
+    """Parses a date string (YYYY-MM-DD) or returns a default."""
+    if not date_str:
+        return default
+    try:
+        return dt.datetime.strptime(date_str, '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        log.warning(f"Invalid date format received: '{date_str}'. Using default: {default}")
+        return default
+
+# --- Routes ---
+
 @app.route('/')
 def index():
-    if not DATABASE_FILE.exists(): init_db()
-    return "SpendLens Backend is running! Database is ready."
+    """Serves the main HTML page."""
+    # Redirect to upload page or a dashboard page if desired
+    # For now, just indicate the backend is running
+    return "SpendLens Backend is running. Use API endpoints."
+    # If you create an index.html in a 'templates' folder:
+    # return render_template('index.html')
 
-@app.route('/upload', methods=['POST'])
-def upload_files():
-    # ... (upload logic - unchanged) ...
-    newly_parsed_transactions = []
-    errors = []
-    file_keys = ['checking_file', 'credit_file']
-    if not request.files: abort(400, description="No file part in the request.")
-    uploaded_files_count = 0
-    for key in file_keys:
-        if key in request.files:
-            file = request.files[key]
-            if file.filename == '': continue
-            if file and allowed_file(file.filename):
-                uploaded_files_count += 1
-                filename = secure_filename(file.filename)
-                file_path = Path(app.config['UPLOAD_FOLDER']) / filename
-                try:
-                    file.save(str(file_path)); logging.info(f"File '{filename}' saved.")
-                    parsed_txs = []
-                    if 'checking' in filename.lower(): parsed_txs = parse_checking_csv(file_path)
-                    elif 'credit' in filename.lower(): parsed_txs = parse_credit_csv(file_path)
-                    else: errors.append(f"Could not determine parser for file: {filename}")
-                    if parsed_txs: newly_parsed_transactions.extend(parsed_txs); logging.info(f"Parsed {len(parsed_txs)} from {filename}.")
-                    elif not any(e.startswith(f"Could not determine parser for file: {filename}") for e in errors): errors.append(f"No transactions parsed or error during parsing for {filename}.")
-                except Exception as e: errors.append(f"Error processing file {filename}: {str(e)}"); logging.error(f"Error processing file {filename}: {e}", exc_info=True)
-                finally:
-                    if file_path.exists():
-                        try: os.remove(file_path); logging.info(f"Removed temp file: {file_path}")
-                        except OSError as remove_err: logging.error(f"Error removing temp file {file_path}: {remove_err}")
-            elif file: errors.append(f"File type not allowed for {file.filename}")
-    if uploaded_files_count == 0 and not errors: abort(400, description="No valid CSV files were uploaded.")
-    total_parsed = len(newly_parsed_transactions)
-    logging.info(f"Parsing complete. Saving {total_parsed} transactions (clear_existing=True).")
-    db_save_error = None
-    try: add_transactions(newly_parsed_transactions, clear_existing=True); logging.info(f"DB save complete.")
-    except Exception as db_err: db_save_error = f"DB error: {str(db_err)}"; errors.append(db_save_error); logging.error(f"DB error: {db_err}", exc_info=True); total_parsed = 0
-    response_data = {"message": f"Processed {uploaded_files_count} file(s). Saved {total_parsed} new transactions.", "errors": errors}
-    status_code = 200 if db_save_error is None else 500
-    if status_code == 200 and errors: status_code = 207
-    return jsonify(response_data), status_code
+@app.route('/upload', methods=['GET', 'POST'])
+def upload_file():
+    """Handles file uploads via GET (shows form) and POST (processes files)."""
+    if request.method == 'POST':
+        if 'checking_file' not in request.files and 'credit_file' not in request.files:
+            return jsonify({"error": "No file part in the request"}), 400
+
+        files_processed = []
+        all_transactions = []
+        errors = []
+
+        # --- Clear existing data before processing new files ---
+        try:
+            database.clear_transactions()
+            parser.clear_user_rules() # Clears only memory, keeps user_rules.json
+            log.info("Cleared existing transactions and user rules (memory only) before new upload.")
+        except Exception as e:
+            log.error(f"Error clearing database or user rules before upload: {e}", exc_info=True)
+            return jsonify({"error": "Failed to prepare database for new upload."}), 500
+        # --- End Clear Data ---
+
+        # Process checking file
+        checking_file = request.files.get('checking_file')
+        if checking_file and checking_file.filename and allowed_file(checking_file.filename):
+            filename = secure_filename(checking_file.filename)
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            try:
+                checking_file.save(filepath)
+                log.info(f"Saved checking file: {filename}")
+                # Determine account type based on filename or content if needed
+                checking_transactions = parser.parse_checking_csv(filepath)
+                all_transactions.extend(checking_transactions)
+                files_processed.append(filename)
+                log.info(f"Parsed {len(checking_transactions)} transactions from {filename}")
+            except Exception as e:
+                log.error(f"Error processing checking file {filename}: {e}", exc_info=True)
+                errors.append(f"Error processing {filename}: {e}")
+            finally:
+                 # Clean up uploaded file after processing
+                 if os.path.exists(filepath):
+                     try: os.remove(filepath); log.info(f"Removed uploaded file: {filepath}")
+                     except OSError as e: log.error(f"Error removing uploaded file {filepath}: {e}")
+
+        # Process credit card file
+        credit_file = request.files.get('credit_file')
+        if credit_file and credit_file.filename and allowed_file(credit_file.filename):
+            filename = secure_filename(credit_file.filename)
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            try:
+                credit_file.save(filepath)
+                log.info(f"Saved credit file: {filename}")
+                credit_transactions = parser.parse_credit_csv(filepath)
+                all_transactions.extend(credit_transactions)
+                files_processed.append(filename)
+                log.info(f"Parsed {len(credit_transactions)} transactions from {filename}")
+            except Exception as e:
+                log.error(f"Error processing credit file {filename}: {e}", exc_info=True)
+                errors.append(f"Error processing {filename}: {e}")
+            finally:
+                 # Clean up uploaded file after processing
+                 if os.path.exists(filepath):
+                     try: os.remove(filepath); log.info(f"Removed uploaded file: {filepath}")
+                     except OSError as e: log.error(f"Error removing uploaded file {filepath}: {e}")
+
+        # Save all parsed transactions to DB
+        saved_count = 0
+        if all_transactions:
+            try:
+                database.save_transactions(all_transactions)
+                saved_count = len(all_transactions) # Assume all were saved if no exception
+            except Exception as e:
+                log.error(f"Error saving transactions to database: {e}", exc_info=True)
+                errors.append(f"Database error: Failed to save transactions.")
+
+        # --- LLM Category Suggestion Step ---
+        llm_suggestions_count = 0
+        if saved_count > 0 and not errors: # Only run if initial save seemed okay
+            try:
+                log.info("Starting LLM category suggestion process...")
+                uncategorized_tx = [tx for tx in all_transactions if tx.category == 'Uncategorized']
+                log.info(f"Found {len(uncategorized_tx)} transactions initially marked as 'Uncategorized'.")
+
+                if uncategorized_tx:
+                    # Define the list of valid categories the LLM can choose from
+                    # TODO: Get this list dynamically, e.g., from a config file or predefined set
+                    valid_categories = [
+                        "Food", "Groceries", "Restaurants", "Coffee Shops",
+                        "Shopping", "Clothing", "Electronics", "Home Goods",
+                        "Utilities", "Electricity", "Gas", "Water", "Internet", "Phone",
+                        "Rent", "Mortgage", "Housing",
+                        "Transportation", "Gas", "Public Transport", "Car Maintenance", "Parking",
+                        "Health & Wellness", "Gym", "Pharmacy", "Doctor",
+                        "Entertainment", "Movies", "Games", "Subscriptions", "Books",
+                        "Travel", "Flights", "Hotels", "Vacation",
+                        "Income", "Salary", "Freelance", "Other Income",
+                        "Transfers", "Payments", "Investment", "Savings",
+                        "Personal Care", "Gifts", "Charity", "Education",
+                        "Business Expense", "Miscellaneous", "Ignore", "Uncategorized"
+                    ]
+
+                    # Combine existing rules for context (optional)
+                    # Be mindful of prompt length limits
+                    context_rules = {}
+                    context_rules.update(parser.VENDOR_RULES)
+                    context_rules.update(parser.USER_RULES) # User rules override vendor rules here
+
+                    # Call the LLM service
+                    suggested_rules_map = llm_service.suggest_categories_for_transactions(
+                        transactions_to_categorize=uncategorized_tx,
+                        valid_categories=valid_categories,
+                        existing_rules=context_rules, # Provide context
+                        # sample_size=10 # Optional: Limit during testing
+                    )
+
+                    # Save the suggested rules
+                    if suggested_rules_map:
+                        log.info(f"Received {len(suggested_rules_map)} category suggestions from LLM. Saving to llm_rules.json...")
+                        for desc_key, suggested_cat in suggested_rules_map.items():
+                            parser.save_llm_rule(desc_key, suggested_cat)
+                            llm_suggestions_count += 1
+                        log.info(f"Finished saving {llm_suggestions_count} LLM rules.")
+                    else:
+                        log.info("LLM did not provide any new category suggestions.")
+                else:
+                    log.info("No 'Uncategorized' transactions found to send to LLM.")
+
+            except Exception as llm_error:
+                log.error(f"Error during LLM category suggestion: {llm_error}", exc_info=True)
+                # Append to errors, but don't necessarily fail the whole upload
+                errors.append(f"LLM Suggestion Error: {llm_error}")
+        # --- End LLM Step ---
+
+
+        # --- Final Response ---
+        final_message = f"Successfully processed and saved {saved_count} transactions from {len(files_processed)} files."
+        if llm_suggestions_count > 0:
+            final_message += f" Generated and saved {llm_suggestions_count} AI category suggestions."
+
+        if not files_processed and not errors:
+             return jsonify({"error": "No valid files uploaded or processed."}), 400
+        elif errors:
+            # Include LLM errors in the response if they occurred
+            return jsonify({
+                "message": final_message + " Encountered errors.",
+                "files_processed": files_processed,
+                "errors": errors
+            }), 500 # Return 500 if any error occurred
+        else:
+            return jsonify({
+                "message": final_message,
+                "files_processed": files_processed
+            }), 201
+    # --- End POST Logic ---
+
+    # If GET request, show a simple upload form
+    return '''
+    <!doctype html>
+    <title>Upload CSV Files</title>
+    <h1>Upload Chase Checking and/or Credit Card CSV</h1>
+    <form method=post enctype=multipart/form-data>
+      <label for="checking_file">Checking CSV:</label>
+      <input type=file name=checking_file id="checking_file"><br><br>
+      <label for="credit_file">Credit Card CSV:</label>
+      <input type=file name=credit_file id="credit_file"><br><br>
+      <input type=submit value=Upload>
+    </form>
+    '''
 
 @app.route('/transactions', methods=['GET'])
 def get_transactions():
-    # ... (filtering logic - unchanged) ...
-    logging.info("'/transactions' endpoint called.")
-    start_date_str = request.args.get('start_date'); end_date_str = request.args.get('end_date'); category_filter = request.args.get('category')
-    if start_date_str:
-        try: dt.date.fromisoformat(start_date_str)
-        except ValueError: abort(400, description="Invalid start_date format.")
-    if end_date_str:
-        try: dt.date.fromisoformat(end_date_str)
-        except ValueError: abort(400, description="Invalid end_date format.")
-    logging.info(f"Filtering with: start={start_date_str}, end={end_date_str}, category='{category_filter}'")
+    """Retrieves transactions, optionally filtered by date range and category."""
+    start_date_str = request.args.get('start_date')
+    end_date_str = request.args.get('end_date')
+    category = request.args.get('category')
+    log.info(f"Received /transactions request with params: start={start_date_str}, end={end_date_str}, category={category}")
+
+    # --- Add Date Validation ---
+    start_date_obj = None
+    end_date_obj = None
     try:
-        filtered_transactions = get_all_transactions(start_date=start_date_str, end_date=end_date_str, category=category_filter)
-        transactions_dict_list = [tx.to_dict() for tx in filtered_transactions]
-        logging.info(f"Returning {len(transactions_dict_list)} filtered transactions.")
-        return jsonify(transactions_dict_list)
-    except Exception as e: logging.error(f"Error retrieving filtered transactions: {e}", exc_info=True); abort(500)
+        if start_date_str: start_date_obj = dt.datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        if end_date_str: end_date_obj = dt.datetime.strptime(end_date_str, '%Y-%m-%d').date()
+    except ValueError:
+         log.error(f"Invalid date format in request parameters.")
+         return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
+
+    if start_date_obj and end_date_obj and start_date_obj > end_date_obj:
+        log.error(f"Start date ({start_date_str}) cannot be after end date ({end_date_str}).")
+        return jsonify({"error": "start_date cannot be after end_date."}), 400
+    # --- End Date Validation ---
+
+    try:
+        transactions = database.get_all_transactions(
+            start_date=start_date_str, # Pass string directly
+            end_date=end_date_str,     # Pass string directly
+            category=category
+        )
+        # Convert transactions to dictionary format for JSON response
+        transactions_dict = [tx.to_dict() for tx in transactions]
+        log.info(f"Returning {len(transactions_dict)} transactions.")
+        return jsonify(transactions_dict)
+    except Exception as e:
+        log.error(f"Error retrieving transactions from database: {e}", exc_info=True)
+        return jsonify({"error": "Failed to retrieve transactions."}), 500
+
+@app.route('/transactions/<int:transaction_id>/category', methods=['PUT'])
+def update_category(transaction_id):
+    """Updates the category for a specific transaction."""
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    new_category = data.get('category')
+
+    if not new_category or not isinstance(new_category, str):
+        return jsonify({"error": "Missing or invalid 'category' field in request body"}), 400
+
+    log.info(f"Received request to update category for ID {transaction_id} to '{new_category}'")
+
+    try:
+        # Optional: Get the transaction first to extract description for user rule
+        # TODO: Implement database.get_transaction_by_id for efficiency
+        transactions = database.get_all_transactions() # Inefficient, gets all transactions
+        transaction_to_update = next((tx for tx in transactions if tx.id == transaction_id), None)
+
+        if not transaction_to_update:
+             log.warning(f"Transaction ID {transaction_id} not found for category update.")
+             return jsonify({"error": "Transaction not found"}), 404
+
+        # Update in database
+        success = database.update_transaction_category(transaction_id, new_category)
+
+        if success:
+            # Save user rule based on the update
+            # Use the RAW description if available, otherwise the cleaned one
+            desc_for_rule = transaction_to_update.raw_description or transaction_to_update.description
+            if desc_for_rule:
+                parser.add_user_rule(desc_for_rule, new_category)
+                log.info(f"Saved user rule based on raw description '{desc_for_rule}' -> '{new_category}'")
+            else:
+                 log.warning(f"Transaction ID {transaction_id} has no description, cannot save user rule.")
+
+            return jsonify({"message": f"Category for transaction {transaction_id} updated to '{new_category}'"}), 200
+        else:
+            # update_transaction_category already logged the warning/error
+            return jsonify({"error": "Failed to update category"}), 500 # Or 404 if appropriate
+    except Exception as e:
+        log.error(f"Unexpected error during category update for ID {transaction_id}: {e}", exc_info=True)
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+
+# --- Analysis Endpoints ---
 
 @app.route('/summary', methods=['GET'])
 def get_summary():
-    # ... (summary logic - unchanged) ...
-    logging.info("'/summary' endpoint called.")
+    """Calculates and returns a financial summary."""
+    # Default date range: last 2 full years from today
+    today = dt.date.today()
+    default_end_date = today
+    default_start_date = today - relativedelta(years=2)
+
+    # Allow overriding with query parameters
+    start_date_query = request.args.get('start_date')
+    end_date_query = request.args.get('end_date')
+
+    start_date = parse_date_param(start_date_query, default_start_date)
+    end_date = parse_date_param(end_date_query, default_end_date)
+
+    # Ensure start is not after end
+    if start_date and end_date and start_date > end_date:
+         log.error(f"Summary request error: Start date ({start_date.isoformat()}) cannot be after end date ({end_date.isoformat()}).")
+         return jsonify({"error": "start_date cannot be after end_date."}), 400
+
+    start_date_str = start_date.isoformat() if start_date else None
+    end_date_str = end_date.isoformat() if end_date else None
+
+    log.info(f"Generating summary for period: {start_date_str} to {end_date_str}")
+
     try:
-        all_db_transactions = get_all_transactions()
-        logging.info(f"Fetched {len(all_db_transactions)} for summary.")
-        if not all_db_transactions: return jsonify({"message": "No transactions found."}), 404
-        summary_data = calculate_summary_insights(all_db_transactions)
-        logging.info("Summary calculation complete.")
+        # 1. Fetch transactions for the period
+        transactions_for_period = database.get_all_transactions(
+            start_date=start_date_str,
+            end_date=end_date_str
+        )
+        # 2. Calculate summary stats using the correct function and transactions
+        summary_data = insights.calculate_summary_insights(transactions_for_period)
         return jsonify(summary_data)
-    except Exception as e: logging.error(f"Error calculating summary: {e}", exc_info=True); abort(500)
-
-@app.route('/transactions/<int:transaction_id>/category', methods=['PUT'])
-def update_category_put(transaction_id):
-    # ... (PUT update logic - unchanged) ...
-    logging.info(f"'/transactions/{transaction_id}/category' (PUT).")
-    raw_data = request.data; logging.info(f"DEBUG: Raw data: {raw_data}")
-    if not request.is_json: abort(400, description=f"Request must be JSON.")
-    data = request.get_json()
-    if data is None: abort(400, description="Failed to decode JSON.")
-    if 'category' not in data or not isinstance(data['category'], str) or not data['category'].strip(): abort(400, description="Invalid 'category' field.")
-    new_category = data['category'].strip()
-    logging.info(f"Attempting PUT update ID {transaction_id} -> '{new_category}'.")
-    try:
-        success = update_transaction_category(transaction_id, new_category)
-        if success:
-            try:
-                updated_tx = get_transaction_by_id(transaction_id)
-                if updated_tx and updated_tx.description: save_user_rule(updated_tx.description, new_category); logging.info(f"Saved user rule for ID {transaction_id}.")
-                else: logging.warning(f"Did not save user rule for ID {transaction_id} (no desc or fetch failed).")
-            except Exception as rule_err: logging.error(f"Error saving user rule for ID {transaction_id}: {rule_err}", exc_info=True)
-            return jsonify({"message": f"Transaction {transaction_id} category updated."}), 200
-        else: abort(404, description=f"Transaction ID {transaction_id} not found.")
-    except NotFound as e: raise e
-    except Exception as e: logging.error(f"Error updating category for ID {transaction_id}: {e}", exc_info=True); abort(500)
-
-@app.route('/transactions/<int:transaction_id>/set_category', methods=['GET'])
-def update_category_get(transaction_id):
-    # ... (GET update logic - unchanged) ...
-    logging.info(f"'/transactions/{transaction_id}/set_category' (GET).")
-    new_category = request.args.get('category')
-    if not new_category or not isinstance(new_category, str) or not new_category.strip(): return "<h1>Bad Request</h1><p>Missing 'category' query parameter.</p>", 400
-    new_category = new_category.strip()
-    logging.info(f"Attempting GET update ID {transaction_id} -> '{new_category}'.")
-    try:
-        success = update_transaction_category(transaction_id, new_category)
-        if success:
-            try:
-                updated_tx = get_transaction_by_id(transaction_id)
-                if updated_tx and updated_tx.description: save_user_rule(updated_tx.description, new_category); logging.info(f"Saved user rule for ID {transaction_id}.")
-                else: logging.warning(f"Did not save user rule for ID {transaction_id} (no desc or fetch failed).")
-            except Exception as rule_err: logging.error(f"Error saving user rule for ID {transaction_id}: {rule_err}", exc_info=True)
-            return f"<h1>Success</h1><p>Transaction {transaction_id} category updated to '{new_category.title()}'.</p>", 200
-        else: return f"<h1>Not Found</h1><p>Transaction ID {transaction_id} not found.</p>", 404
-    except Exception as e: logging.error(f"Error updating category ID {transaction_id}: {e}", exc_info=True); return f"<h1>Error</h1><p>{e}</p>", 500
+    except AttributeError:
+        log.error(f"AttributeError: Could not find 'calculate_summary_insights' in module 'insights'. Check insights.py.", exc_info=True)
+        return jsonify({"error": "Internal server error: Summary calculation function not found."}), 500
+    except Exception as e:
+        log.error(f"Error generating summary statistics: {e}", exc_info=True)
+        return jsonify({"error": "Failed to generate summary."}), 500
 
 @app.route('/trends/monthly_spending', methods=['GET'])
-def get_monthly_spending_trends():
-    # ... (trends logic - unchanged) ...
-    logging.info("'/trends/monthly_spending' called.")
+def get_monthly_trends():
+    """Calculates and returns month-over-month spending trends."""
+    # Get optional date range parameters
+    start_date_query = request.args.get('start_date')
+    end_date_query = request.args.get('end_date')
+
+    # Parse dates if provided, otherwise insights function might use defaults
+    start_date = None
+    end_date = None
+    if start_date_query:
+        start_date = parse_date_param(start_date_query, None) # Pass None as default
+        if not start_date: return jsonify({"error": "Invalid start_date format."}), 400
+    if end_date_query:
+        end_date = parse_date_param(end_date_query, None) # Pass None as default
+        if not end_date: return jsonify({"error": "Invalid end_date format."}), 400
+
+    if start_date and end_date and start_date > end_date:
+         log.error(f"Trends request error: Start date ({start_date.isoformat()}) cannot be after end date ({end_date.isoformat()}).")
+         return jsonify({"error": "start_date cannot be after end_date."}), 400
+
+    log.info(f"Calculating monthly trends. Start: {start_date}, End: {end_date}")
+
     try:
-        all_db_transactions = get_all_transactions()
-        logging.info(f"Fetched {len(all_db_transactions)} for trends.")
-        if not all_db_transactions: return jsonify({"message": "No transactions available."}), 404
-        trends_data = calculate_monthly_trends(all_db_transactions)
-        logging.info("Trend calculation complete.")
-        if "error" in trends_data: return jsonify(trends_data), 400
+        # Pass parsed date objects (or None) to the insights function
+        trends_data = insights.calculate_monthly_spending_trends(start_date=start_date, end_date=end_date)
         return jsonify(trends_data)
-    except Exception as e: logging.error(f"Error calculating trends: {e}", exc_info=True); abort(500)
+    except Exception as e:
+        log.error(f"Error calculating monthly trends: {e}", exc_info=True)
+        return jsonify({"error": "Failed to calculate monthly trends."}), 500
 
+# --- CORRECTED FUNCTION CALL ---
 @app.route('/recurring', methods=['GET'])
-def get_recurring_transactions():
-    # ... (recurring logic - unchanged) ...
-    logging.info("'/recurring' called.")
-    try: min_occurrences = int(request.args.get('min_occurrences', 3)); days_tolerance = int(request.args.get('days_tolerance', 3)); amount_tolerance_percent = float(request.args.get('amount_tolerance_percent', 5.0))
-    except ValueError: abort(400, description="Invalid threshold parameter(s).")
-    logging.info(f"Recurring thresholds: min={min_occurrences}, days={days_tolerance}, amount%={amount_tolerance_percent}")
+def get_recurring():
+    """Identifies potential recurring transactions."""
+    # Allow overriding default parameters via query args
     try:
-        all_db_transactions = get_all_transactions()
-        logging.info(f"Fetched {len(all_db_transactions)} for recurring.")
-        if not all_db_transactions: return jsonify([])
-        recurring_data = identify_recurring_transactions(all_db_transactions, min_occurrences=min_occurrences, days_tolerance=days_tolerance, amount_tolerance_percent=amount_tolerance_percent)
-        logging.info(f"Identified {len(recurring_data)} recurring groups.")
+        min_occurrences = int(request.args.get('min_occurrences', 3))
+        days_tolerance = int(request.args.get('days_tolerance', 5))
+        amount_tolerance_percent = float(request.args.get('amount_tolerance_percent', 10.0))
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid query parameter type for recurring detection."}), 400
+
+    log.info(f"Detecting recurring transactions with params: min_occurrences={min_occurrences}, days_tolerance={days_tolerance}, amount_tolerance={amount_tolerance_percent}%")
+
+    try:
+        # --- UNCOMMENTED FETCHING TRANSACTIONS ---
+        # Fetch all transactions (or filter by date if desired for recurring)
+        all_transactions = database.get_all_transactions()
+        # --- END UNCOMMENT ---
+
+        # --- Use the correct function name and pass transactions ---
+        recurring_data = insights.identify_recurring_transactions(
+            transactions=all_transactions, # Pass the fetched transactions
+            min_occurrences=min_occurrences,
+            days_tolerance=days_tolerance,
+            amount_tolerance_percent=amount_tolerance_percent
+        )
+        # --- End correction ---
         return jsonify(recurring_data)
-    except Exception as e: logging.error(f"Error identifying recurring: {e}", exc_info=True); abort(500)
+    except AttributeError:
+        # Specific handling for the case where the function might not exist
+        log.error(f"AttributeError: Could not find 'identify_recurring_transactions' in module 'insights'. Check insights.py.", exc_info=True)
+        return jsonify({"error": "Internal server error: Recurring transaction function not found."}), 500
+    except Exception as e:
+        log.error(f"Error detecting recurring transactions: {e}", exc_info=True)
+        return jsonify({"error": "Failed to detect recurring transactions."}), 500
+# --- END OF CORRECTED FUNCTION CALL ---
 
-@app.route('/analysis/frequent_spending', methods=['GET'])
-def get_frequent_spending():
-    # ... (frequent spending logic - unchanged) ...
-    logging.info("'/analysis/frequent_spending' endpoint called.")
-    start_date_str = request.args.get('start_date'); end_date_str = request.args.get('end_date'); min_freq_str = request.args.get('min_frequency', '2')
-    start_date, end_date = None, None; min_frequency = 2
-    if start_date_str:
-        try: start_date = dt.date.fromisoformat(start_date_str)
-        except ValueError: abort(400, description="Invalid start_date format.")
-    if end_date_str:
-        try: end_date = dt.date.fromisoformat(end_date_str)
-        except ValueError: abort(400, description="Invalid end_date format.")
-    min_frequency_val = None
-    try: min_frequency_val = int(min_freq_str)
-    except ValueError: logging.warning(f"Invalid min_frequency parameter '{min_freq_str}'."); abort(400, description="Invalid min_frequency parameter.")
-    if min_frequency_val < 1: logging.warning(f"min_frequency parameter must be >= 1, got {min_frequency_val}"); abort(400, description="min_frequency parameter must be at least 1.")
-    min_frequency = min_frequency_val
-    logging.info(f"Frequent spending params: start={start_date}, end={end_date}, min_freq={min_frequency}")
-    try:
-        all_db_transactions = get_all_transactions()
-        logging.info(f"Fetched {len(all_db_transactions)} for frequent spending.")
-        if not all_db_transactions: return jsonify([])
-        frequent_data = analyze_frequent_spending(all_db_transactions, start_date=start_date, end_date=end_date, min_frequency=min_frequency)
-        logging.info(f"Identified {len(frequent_data)} frequent spending patterns.")
-        return jsonify(frequent_data)
-    except Exception as e: logging.error(f"Error analyzing frequent spending: {e}", exc_info=True); abort(500)
-
-@app.route('/analysis/duplicate_recurring', methods=['GET'])
-def get_duplicate_recurring():
-    # ... (duplicate recurring logic - unchanged) ...
-    logging.info("'/analysis/duplicate_recurring' called.")
-    try:
-        min_occurrences = int(request.args.get('min_occurrences', 3)); days_tolerance = int(request.args.get('days_tolerance', 3)); amount_tolerance_percent = float(request.args.get('amount_tolerance_percent', 5.0))
-        dup_amount_similarity = float(request.args.get('dup_amount_similarity', 10.0)); dup_max_days_apart = int(request.args.get('dup_max_days_apart', 7))
-    except ValueError: abort(400, description="Invalid threshold parameter(s).")
-    logging.info(f"Duplicate check using: rec_min={min_occurrences}, rec_days={days_tolerance}, rec_amt%={amount_tolerance_percent}, dup_amt%={dup_amount_similarity}, dup_days={dup_max_days_apart}")
-    try:
-        all_db_transactions = get_all_transactions()
-        logging.info(f"Fetched {len(all_db_transactions)} for duplicate recurring.")
-        if not all_db_transactions: return jsonify([])
-        recurring_items = identify_recurring_transactions(all_db_transactions, min_occurrences=min_occurrences, days_tolerance=days_tolerance, amount_tolerance_percent=amount_tolerance_percent)
-        logging.info(f"Identified {len(recurring_items)} recurring items to check.")
-        if not recurring_items: return jsonify([])
-        duplicate_data = find_potential_duplicate_recurring(recurring_items, amount_similarity_percent=dup_amount_similarity, max_days_apart_in_month=dup_max_days_apart)
-        logging.info(f"Identified {len(duplicate_data)} potential duplicate groups.")
-        return jsonify(duplicate_data)
-    except Exception as e: logging.error(f"Error finding duplicate recurring: {e}", exc_info=True); abort(500)
+# --- LLM Endpoints ---
 
 @app.route('/analysis/llm_summary', methods=['GET'])
 def get_llm_summary():
-    # ... (LLM summary logic with date filtering - unchanged) ...
-    logging.info("'/analysis/llm_summary' endpoint called.")
-    start_date_str = request.args.get('start_date'); end_date_str = request.args.get('end_date')
-    start_date, end_date = None, None
-    if start_date_str:
-        try: start_date = dt.date.fromisoformat(start_date_str)
-        except ValueError: abort(400, description="Invalid start_date format.")
-    if end_date_str:
-        try: end_date = dt.date.fromisoformat(end_date_str)
-        except ValueError: abort(400, description="Invalid end_date format.")
-    if not start_date or not end_date:
-        today = dt.date.today(); first_of_current_month = today.replace(day=1)
-        default_end_date = first_of_current_month - relativedelta(days=1)
-        default_start_date = first_of_current_month - relativedelta(months=3)
-        if not start_date: start_date = default_start_date
-        if not end_date: end_date = default_end_date
-        logging.info(f"Using date range for LLM summary: {start_date.isoformat()} to {end_date.isoformat()} (Default or Provided)")
-    else: logging.info(f"Using provided date range for LLM summary: {start_date.isoformat()} to {end_date.isoformat()}")
-    start_date_query_str = start_date.isoformat(); end_date_query_str = end_date.isoformat()
+    """Generates a financial summary using the LLM."""
+    # Default date range: last 3 full months
+    today = dt.date.today()
+    # Calculate end of last month
+    default_end_date = today.replace(day=1) - dt.timedelta(days=1)
+    # Calculate start of month 3 months before end_date's month
+    default_start_date = (default_end_date.replace(day=1) - relativedelta(months=2))
+
+    # Allow overriding with query parameters
+    start_date_query = request.args.get('start_date')
+    end_date_query = request.args.get('end_date')
+
+    start_date = parse_date_param(start_date_query, default_start_date)
+    end_date = parse_date_param(end_date_query, default_end_date)
+
+    if start_date and end_date and start_date > end_date:
+        log.error(f"LLM Summary request error: Start date ({start_date.isoformat()}) cannot be after end date ({end_date.isoformat()}).")
+        return jsonify({"error": "start_date cannot be after end_date."}), 400
+
+    start_date_str = start_date.isoformat() if start_date else None
+    end_date_str = end_date.isoformat() if end_date else None
+    log.info(f"Generating LLM summary for period: {start_date_str} to {end_date_str}")
+
     try:
-        transactions_for_period = get_all_transactions(start_date=start_date_query_str, end_date=end_date_query_str)
-        logging.info(f"Fetched {len(transactions_for_period)} transactions for LLM analysis period.")
-        if not transactions_for_period: return jsonify({"summary": f"No transaction data found for the period {start_date_query_str} to {end_date_query_str}."}), 404
-        summary_data = calculate_summary_insights(transactions_for_period)
-        trends_data = calculate_monthly_trends(transactions_for_period)
-        logging.info("Generated necessary data for LLM summary based on filtered period.")
-        llm_summary_text = generate_financial_summary(summary_data, trends_data, start_date_query_str, end_date_query_str)
-        if llm_summary_text.startswith("Error:"):
-             status_code = 503 if "API error" in llm_summary_text or "not configured" in llm_summary_text else 500
-             return jsonify({"error": llm_summary_text}), status_code
-        logging.info("LLM summary generated successfully.")
+        # 1. Fetch transactions for the period
+        transactions_for_period = database.get_all_transactions(
+            start_date=start_date_str,
+            end_date=end_date_str
+        )
+        # 2. Get summary stats using the correct function
+        summary_data = insights.calculate_summary_insights(transactions_for_period)
+
+        # 3. Get trends data for the relevant period
+        trends_data = insights.calculate_monthly_spending_trends(start_date=start_date, end_date=end_date) # Pass dates
+
+        # 4. Call LLM service
+        llm_summary_text = llm_service.generate_financial_summary(summary_data, trends_data, start_date_str, end_date_str)
+
         return jsonify({"summary": llm_summary_text})
-    except Exception as e: logging.error(f"Error generating LLM summary: {e}", exc_info=True); abort(500)
+    except AttributeError:
+        # Specific handling for the case where the function *still* might not exist
+        log.error(f"AttributeError: Could not find function in 'insights' module. Check insights.py.", exc_info=True)
+        return jsonify({"error": "Internal server error: Analysis function not found."}), 500
+    except Exception as e:
+        log.error(f"Error generating LLM summary: {e}", exc_info=True)
+        return jsonify({"error": f"Failed to generate LLM summary: {type(e).__name__}"}), 500
 
 
-# --- Change: Update /ask Endpoint ---
 @app.route('/ask', methods=['GET'])
-def ask_llm_question():
-    """Answers a user's financial question using the LLM and transaction data."""
-    logging.info("'/ask' endpoint called.")
+def ask_llm():
+    """Answers a financial question using the LLM, potentially with pre-calculation."""
     question = request.args.get('query')
-    if not question or not isinstance(question, str) or not question.strip():
-        abort(400, description="Missing or invalid 'query' parameter.")
+    if not question:
+        return jsonify({"error": "Missing 'query' parameter"}), 400
 
-    start_date_str = request.args.get('start_date')
-    end_date_str = request.args.get('end_date')
-    start_date, end_date = None, None
-    user_provided_dates = False
+    # --- Date Range Handling (Consistent with /summary and /llm_summary) ---
+    today = dt.date.today()
+    # Default: last 2 years for broader context in Q&A
+    default_end_date = today
+    default_start_date = today - relativedelta(years=2)
 
-    if start_date_str:
-        try: start_date = dt.date.fromisoformat(start_date_str); user_provided_dates = True
-        except ValueError: abort(400, description="Invalid start_date format.")
-    if end_date_str:
-        try: end_date = dt.date.fromisoformat(end_date_str); user_provided_dates = True
-        except ValueError: abort(400, description="Invalid end_date format.")
+    start_date_query = request.args.get('start_date')
+    end_date_query = request.args.get('end_date')
 
-    # --- Change: Intelligent Date Filtering (Default to 2 years if no dates) ---
-    if not user_provided_dates:
-        year_match = re.search(r'\b(20\d{2})\b', question)
-        month_match = re.search(r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b', question, re.IGNORECASE)
-        # Add more sophisticated date parsing here if needed
+    start_date = parse_date_param(start_date_query, default_start_date)
+    end_date = parse_date_param(end_date_query, default_end_date)
 
-        if year_match:
-            year = int(year_match.group(1))
-            # If month also mentioned, scope to that month? For now, year takes precedence
-            start_date = dt.date(year, 1, 1); end_date = dt.date(year, 12, 31)
-            start_date_str = start_date.isoformat(); end_date_str = end_date.isoformat()
-            logging.info(f"Detected year {year}, setting range: {start_date_str} to {end_date_str}")
-        # --- Change: Default to last 2 years if no specific range detected ---
-        else:
-            today = dt.date.today()
-            start_date = today - relativedelta(years=2)
-            end_date = today # Include today
-            start_date_str = start_date.isoformat(); end_date_str = end_date.isoformat()
-            logging.info(f"No specific date range detected/provided for Q&A. Defaulting to last 2 years: {start_date_str} to {end_date_str}")
-        # --- End Change ---
+    if start_date and end_date and start_date > end_date:
+         log.error(f"/ask request error: Start date ({start_date.isoformat()}) cannot be after end date ({end_date.isoformat()}).")
+         return jsonify({"error": "start_date cannot be after end_date."}), 400
 
-    logging.info(f"Received question: '{question}'. Fetching data from {start_date_str or 'start'} to {end_date_str or 'end'}")
+    start_date_str = start_date.isoformat() if start_date else None
+    end_date_str = end_date.isoformat() if end_date else None
+    log.info(f"Received /ask request for period {start_date_str} to {end_date_str}. Query: '{question}'")
+    # --- End Date Range Handling ---
+
+    pre_calculated_result: Optional[Decimal] = None
+    calculation_performed = False
+
+    # --- Simple Keyword-Based Calculation Detection ---
+    q_lower = question.lower()
+    try:
+        # Check for Income Calculation
+        # More robust: Use regex or simple NLP later
+        if ("income" in q_lower and ("total" in q_lower or "how much" in q_lower or "sum" in q_lower)) or \
+           ("much did i earn" in q_lower):
+            log.info("Detected potential income calculation request.")
+            # Ensure start/end dates are strings for the database function
+            if start_date_str and end_date_str:
+                pre_calculated_result = database.calculate_total_for_period(
+                    start_date=start_date_str,
+                    end_date=end_date_str,
+                    transaction_type='income',
+                    exclude_categories=['Payments', 'Transfers'] # Crucial exclusion
+                )
+                calculation_performed = True
+                log.info(f"Pre-calculated income result: {pre_calculated_result}")
+            else:
+                log.warning("Cannot perform calculation without valid start/end dates.")
+
+
+        # Check for Spending Calculation (General or by Category)
+        # More robust: Use regex or simple NLP later
+        elif ("spending" in q_lower or "spent" in q_lower or "cost" in q_lower) and \
+             ("total" in q_lower or "how much" in q_lower or "sum" in q_lower):
+            log.info("Detected potential spending calculation request.")
+            # Try to extract category (very basic)
+            category_to_calc = None
+            # Example: "how much spent on Food" -> category_to_calc = "Food"
+            # This needs significant improvement for real-world use
+            words = q_lower.split()
+            if "on" in words:
+                try:
+                    on_index = words.index("on")
+                    if on_index + 1 < len(words):
+                         # Capitalize potential category name to match DB storage
+                         potential_cat = words[on_index + 1].capitalize()
+                         # TODO: Check if potential_cat is a valid category?
+                         category_to_calc = potential_cat
+                         log.info(f"Extracted potential category for spending calculation: {category_to_calc}")
+                except ValueError:
+                    pass # "on" not found
+
+            if start_date_str and end_date_str:
+                pre_calculated_result = database.calculate_total_for_period(
+                    start_date=start_date_str,
+                    end_date=end_date_str,
+                    category=category_to_calc, # Pass category if found
+                    transaction_type='spending'
+                )
+                calculation_performed = True
+                # Spending is negative, format appropriately if needed for LLM
+                log.info(f"Pre-calculated spending result: {pre_calculated_result}")
+            else:
+                 log.warning("Cannot perform calculation without valid start/end dates.")
+
+
+    except Exception as calc_error:
+        log.error(f"Error during pre-calculation attempt: {calc_error}", exc_info=True)
+        # Decide if you want to proceed without calculation or return an error
+        # Proceeding allows LLM to try, but might give wrong answer if calculation was intended
+        calculation_performed = False # Ensure we know calculation failed
+        pre_calculated_result = None
+    # --- End Calculation Detection ---
+
 
     try:
-        # Fetch transactions using the determined date range
-        transactions_for_llm = get_all_transactions(start_date=start_date, end_date=end_date)
-        logging.info(f"Fetched {len(transactions_for_llm)} transactions for question context.")
+        # 1. Fetch transactions for the period (LLM still needs context)
+        transactions = database.get_all_transactions(
+            start_date=start_date_str,
+            end_date=end_date_str
+        )
+        # 2. Calculate summary stats using the correct function
+        # Pass the already fetched transactions to avoid hitting DB again
+        summary_data = insights.calculate_summary_insights(transactions)
 
-        if not transactions_for_llm:
-             if start_date or end_date: return jsonify({"answer": f"I couldn't find any transactions between {start_date_str or 'start'} and {end_date_str or 'end'}."}), 404
-             else: return jsonify({"answer": "There are no transactions loaded."}), 404
-
-        # Calculate summary for the fetched period
-        summary_data_for_period = calculate_summary_insights(transactions_for_llm)
-        logging.info("Calculated summary data for the relevant period for Q&A.")
-
-        # Call the LLM service function, passing summary and transactions
-        llm_answer = answer_financial_question(
-            question,
-            transactions_for_llm,
-            summary_data_for_period,
-            start_date_str,
-            end_date_str
+        # 3. Call LLM service, passing the pre-calculated result if available
+        llm_answer = llm_service.answer_financial_question(
+            question=question,
+            transactions=transactions,
+            summary_data=summary_data,
+            start_date_str=start_date_str,
+            end_date_str=end_date_str,
+            pre_calculated_result=pre_calculated_result # Pass the result
         )
 
-        if llm_answer.startswith("Error:"):
-            status_code = 503 if "API error" in llm_answer or "not configured" in llm_answer else 500
-            return jsonify({"error": llm_answer}), status_code
-
-        logging.info("LLM answer generated successfully.")
+        log.info("LLM answer generated successfully.")
         return jsonify({"question": question, "answer": llm_answer})
-
+    except AttributeError as attr_err:
+        # Check if the error is specifically about calculate_summary_insights
+        if 'calculate_summary_insights' in str(attr_err):
+            log.error(f"AttributeError: Could not find 'calculate_summary_insights' in module 'insights'. Check insights.py.", exc_info=True)
+            return jsonify({"error": "Internal server error: Summary calculation function not found."}), 500
+        else:
+            # Handle other potential AttributeErrors
+            log.error(f"AttributeError during LLM question answering: {attr_err}", exc_info=True)
+            return jsonify({"error": f"Failed to get answer from LLM: AttributeError"}), 500
     except Exception as e:
-        logging.error(f"Error answering question '{question}': {e}", exc_info=True)
-        abort(500, description="Internal server error answering question.")
-# --- End Change ---
+        log.error(f"Error during LLM question answering: {e}", exc_info=True)
+        return jsonify({"error": f"Failed to get answer from LLM: {type(e).__name__}"}), 500
 
+
+# --- Favicon Route (Optional) ---
+@app.route('/favicon.ico')
+def favicon():
+    # Serve a favicon if you have one in a 'static' folder
+    # Ensure you have a 'static' folder next to app.py with favicon.ico inside
+    static_folder = os.path.join(app.root_path, 'static')
+    favicon_path = os.path.join(static_folder, 'favicon.ico')
+    if os.path.exists(favicon_path):
+        return send_from_directory(static_folder, 'favicon.ico', mimetype='image/vnd.microsoft.icon')
+    else:
+        # Return a 404 if favicon doesn't exist
+        return '', 404
 
 # --- Main Execution ---
 if __name__ == '__main__':
-    logging.info("Initializing database...")
-    init_db()
-    if not os.path.exists(UPLOAD_FOLDER): os.makedirs(UPLOAD_FOLDER)
-    app.run(debug=True, port=5001)
-
+    # Make sure database is initialized before running
+    database.initialize_database()
+    # Run the Flask app
+    # Use host='0.0.0.0' to make it accessible on your network
+    # Use debug=True for development (provides auto-reloading and debugger)
+    # Use debug=False for production
+    app.run(host=app.config.get('HOST', '127.0.0.1'),
+            port=app.config.get('PORT', 5001),
+            debug=app.config.get('DEBUG', True))

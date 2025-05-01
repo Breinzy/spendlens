@@ -1,344 +1,475 @@
+# insights.py
+
 import logging
 from collections import defaultdict, Counter
-from decimal import Decimal, ROUND_HALF_UP
 import datetime as dt
-# Change: Import relativedelta if not already present
 from dateutil.relativedelta import relativedelta
-from typing import List, Dict, Tuple, Optional, Any
+from decimal import Decimal, InvalidOperation
+from typing import List, Dict, Any, Optional # Added Optional for type hints
 
-# Import the Transaction class definition from parser
+# --- MOVED LOGGING CONFIGURATION UP ---
+# Configure logging
+log = logging.getLogger('insights') # Use specific logger name
+log.setLevel(logging.INFO)
+if not log.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(name)s] - %(message)s')
+    handler.setFormatter(formatter)
+    log.addHandler(handler)
+# --- END OF MOVE ---
+
+# --- Import Transaction Class Safely ---
+# Attempt to import the real Transaction class from database or parser
+# Define a placeholder if import fails, to prevent load-time errors
 try:
-    from parser import Transaction, _clean_description_for_rule
+    # Prioritize importing from database.py if it defines the class consistently
+    from database import Transaction
+    log.info("Successfully imported Transaction class from database module.") # Now log is defined
 except ImportError:
-    logging.warning("Could not import Transaction or _clean_description_for_rule from parser. Assuming basic structure.")
-    import re
-    class Transaction: # Minimal definition
-        def __init__(self, date, description, amount, category="Uncategorized", transaction_type=None, id=None, raw_description=None, **kwargs):
-            self.id = id; self.date = date; self.description = description; self.raw_description = raw_description
-            self.amount = Decimal(amount); self.category = category if category else "Uncategorized"; self.transaction_type = transaction_type
-    def _clean_description_for_rule(description: str) -> str:
-        if not description: return ""
-        cleaned = re.sub(r'\s+\d{1,2}/\d{1,2}(?:/\d{2,4})?\s*$', '', description); cleaned = re.sub(r'\s{2,}', ' ', cleaned)
-        return cleaned.strip()
+    try:
+        # Fallback to importing from parser.py
+        from parser import Transaction
+        log.info("Successfully imported Transaction class from parser module.") # Now log is defined
+    except ImportError:
+        log.warning("Could not import Transaction class from database or parser. Defining placeholder.") # Now log is defined
+        # Define a placeholder class with expected attributes if import fails
+        class Transaction:
+            id: int = 0
+            date: Optional[dt.date] = None
+            description: Optional[str] = None
+            amount: Optional[Decimal] = None
+            category: Optional[str] = None
+            transaction_type: Optional[str] = None
+            # Add other attributes if your insights functions expect them
+
+# --- Removed import of non-existent function ---
+# from parser import _clean_description_for_rule # This function doesn't exist in parser.py
 
 
-# Define categories (lowercase)
-TRANSFER_CATEGORIES = {"transfers", "payments"}
-INCOME_CATEGORIES = {"income"}
-# Change: Define categories likely to have recurring duplicates (e.g., subscriptions, maybe utilities)
-DUPLICATE_CHECK_CATEGORIES = {"subscriptions", "utilities", "services", "fees & adjustments", "uncategorized"} # Add more as needed
+# --- Helper Function ---
+def get_month_year_str(date_obj: dt.date) -> str:
+    """Formats a date object into 'YYYY-MM' string."""
+    return date_obj.strftime('%Y-%m')
 
-
-def _validate_transactions(transactions: List[Transaction]) -> List[Transaction]:
-    """Helper to ensure transactions have Decimal amounts."""
-    # ... (validation logic remains the same) ...
-    valid_transactions = []
-    for tx in transactions:
-        if not isinstance(tx.amount, Decimal):
-            try: tx.amount = Decimal(tx.amount); valid_transactions.append(tx)
-            except Exception as e: logging.warning(f"Skipping transaction during validation: {tx} | Error: {e}")
-        else: valid_transactions.append(tx)
-    return valid_transactions
-
-def _is_operational_spending(tx: Transaction) -> bool:
-    """Helper to determine if a transaction is operational spending."""
-    category_lower = tx.category.lower() if isinstance(tx.category, str) else ""
-    return tx.amount < 0 and category_lower not in TRANSFER_CATEGORIES
-
-# (calculate_summary_insights function remains the same)
-def calculate_summary_insights(transactions: List[Transaction]) -> Dict[str, any]:
-    # ... (summary calculation logic remains the same) ...
-    valid_transactions = _validate_transactions(transactions)
-    operational_income = Decimal('0.00'); operational_spending = Decimal('0.00')
-    transfers_in = Decimal('0.00'); transfers_out = Decimal('0.00')
-    spending_by_category: Dict[str, Decimal] = defaultdict(Decimal)
-    income_by_category: Dict[str, Decimal] = defaultdict(Decimal)
-    refunds_by_category: Dict[str, Decimal] = defaultdict(Decimal)
-    for tx in valid_transactions:
-        category_lower = tx.category.lower() if isinstance(tx.category, str) else ""
-        amount = tx.amount
-        is_transfer_or_payment = category_lower in TRANSFER_CATEGORIES
-        is_income_category = category_lower in INCOME_CATEGORIES
-        is_likely_refund = amount > 0 and not is_income_category and not is_transfer_or_payment
-        if amount > 0:
-            income_by_category[tx.category] += amount
-            if is_transfer_or_payment: transfers_in += amount
-            elif is_income_category: operational_income += amount
-            elif is_likely_refund: refunds_by_category[tx.category] += amount
-            else: operational_income += amount
-        elif _is_operational_spending(tx):
-             operational_spending += abs(amount); spending_by_category[tx.category] += abs(amount)
-        elif amount < 0: transfers_out += abs(amount)
-    net_spending_by_category: Dict[str, Decimal] = defaultdict(Decimal)
-    for category, spent in spending_by_category.items():
-         if category.lower() not in TRANSFER_CATEGORIES:
-            refunded = refunds_by_category.get(category, Decimal('0.00'))
-            net_spending_by_category[category] = max(Decimal('0.00'), spent - refunded)
-         else: net_spending_by_category[category] = spent
-    net_operational_flow = operational_income - operational_spending
-    net_transfer_flow = transfers_in - transfers_out
-    def capitalize_dict_keys(d: Dict[str, Decimal]) -> Dict[str, Decimal]: return {k.title() if isinstance(k, str) else k: v for k, v in d.items()}
+# --- Summary Statistics ---
+def calculate_summary_insights(transactions: List[Transaction]) -> Dict[str, Any]:
+    """
+    Calculates various summary statistics from a list of transactions.
+    """
+    log.info(f"Calculating summary insights for {len(transactions)} transactions.")
     summary = {
-        "operational_income": operational_income, "operational_spending": operational_spending,
-        "net_operational_flow": net_operational_flow, "transfers_in": transfers_in, "transfers_out": transfers_out,
-        "net_transfer_flow": net_transfer_flow, "spending_by_category": capitalize_dict_keys(spending_by_category),
-        "income_by_category": capitalize_dict_keys(income_by_category), "refunds_by_category": capitalize_dict_keys(refunds_by_category),
-        "net_spending_by_category": capitalize_dict_keys(net_spending_by_category),
-        "net_total_flow_all": net_operational_flow + net_transfer_flow, "transaction_count": len(valid_transactions) }
+        "total_transactions": len(transactions),
+        "period_start_date": None,
+        "period_end_date": None,
+        "total_income": Decimal('0'),
+        "total_spending": Decimal('0'), # Operational spending (excludes Payments/Transfers)
+        "total_payments_transfers": Decimal('0'), # Sum of Payments/Transfers
+        "net_flow_operational": Decimal('0'), # Income - Operational Spending
+        "net_change_total": Decimal('0'), # Sum of all amounts
+        "spending_by_category": defaultdict(Decimal),
+        "income_by_category": defaultdict(Decimal), # Track income sources if needed
+        "average_transaction_amount": Decimal('0'),
+        "median_transaction_amount": Decimal('0'),
+    }
+
+    if not transactions:
+        log.warning("No transactions provided for summary calculation.")
+        return summary # Return default summary if no transactions
+
+    # Filter out transactions without a date before sorting
+    valid_transactions = [tx for tx in transactions if tx.date is not None]
+    if not valid_transactions:
+        log.warning("No transactions with valid dates provided for summary calculation.")
+        return summary
+
+    # Sort transactions by date to find start/end
+    valid_transactions.sort(key=lambda t: t.date) # type: ignore
+    summary["period_start_date"] = valid_transactions[0].date.isoformat() if valid_transactions[0].date else None
+    summary["period_end_date"] = valid_transactions[-1].date.isoformat() if valid_transactions[-1].date else None
+
+    all_amounts = []
+    operational_categories = ['Payments', 'Transfers', 'Ignore'] # Categories to exclude from operational spending/income
+
+    for tx in valid_transactions: # Iterate over valid transactions
+        if not hasattr(tx, 'amount') or tx.amount is None: continue # Skip transactions without amount attribute or None amount
+
+        try:
+            # Ensure amount is Decimal
+            amount_dec = Decimal(tx.amount)
+        except (InvalidOperation, TypeError):
+            log.warning(f"Skipping transaction ID {getattr(tx, 'id', 'N/A')} due to invalid amount type: {tx.amount}")
+            continue
+
+        summary["net_change_total"] += amount_dec
+        all_amounts.append(amount_dec)
+
+        category = getattr(tx, 'category', 'Uncategorized') # Use getattr for safety
+
+        # Accumulate totals based on category and amount sign
+        if amount_dec > 0:
+            summary["income_by_category"][category] += amount_dec
+            if category not in operational_categories:
+                 summary["total_income"] += amount_dec
+            else:
+                 summary["total_payments_transfers"] += amount_dec # Add positive payments/transfers here
+        elif amount_dec < 0:
+            summary["spending_by_category"][category] += amount_dec # Store spending as negative
+            if category not in operational_categories:
+                summary["total_spending"] += amount_dec # Add negative amount
+            else:
+                summary["total_payments_transfers"] += amount_dec # Add negative payments/transfers here
+
+
+    # Calculate derived metrics
+    summary["net_flow_operational"] = summary["total_income"] + summary["total_spending"] # spending is negative
+
+    if all_amounts:
+        try:
+            summary["average_transaction_amount"] = sum(all_amounts) / len(all_amounts)
+            # Calculate median
+            sorted_amounts = sorted(all_amounts)
+            n = len(sorted_amounts)
+            mid = n // 2
+            if n % 2 == 1:
+                summary["median_transaction_amount"] = sorted_amounts[mid]
+            else:
+                # Ensure division by 2 results in Decimal
+                summary["median_transaction_amount"] = (sorted_amounts[mid - 1] + sorted_amounts[mid]) / Decimal('2')
+        except ZeroDivisionError:
+             log.warning("Cannot calculate average transaction amount: list of amounts is empty.")
+             summary["average_transaction_amount"] = Decimal('0')
+             summary["median_transaction_amount"] = Decimal('0')
+
+
+    # Convert defaultdicts to regular dicts and amounts to strings for JSON
+    summary["spending_by_category"] = {k: str(v) for k, v in summary["spending_by_category"].items()}
+    summary["income_by_category"] = {k: str(v) for k, v in summary["income_by_category"].items()}
+    summary["total_income"] = str(summary["total_income"])
+    summary["total_spending"] = str(summary["total_spending"])
+    summary["total_payments_transfers"] = str(summary["total_payments_transfers"])
+    summary["net_flow_operational"] = str(summary["net_flow_operational"])
+    summary["net_change_total"] = str(summary["net_change_total"])
+    summary["average_transaction_amount"] = str(summary["average_transaction_amount"])
+    summary["median_transaction_amount"] = str(summary["median_transaction_amount"])
+
+
+    log.info("Summary insights calculation finished.")
     return summary
 
-# (calculate_monthly_trends function remains the same)
-def calculate_monthly_trends(transactions: List[Transaction]) -> Dict[str, Any]:
-    # ... (monthly trends calculation logic remains the same) ...
-    valid_transactions = _validate_transactions(transactions)
-    if not valid_transactions: return {"error": "No valid transactions provided."}
-    transactions.sort(key=lambda tx: tx.date); latest_date = transactions[-1].date
-    current_month_end = dt.date(latest_date.year, latest_date.month, 1) - dt.timedelta(days=1)
-    current_month_start = dt.date(current_month_end.year, current_month_end.month, 1); current_month_str = current_month_start.strftime("%Y-%m")
-    previous_month_end = current_month_start - dt.timedelta(days=1)
-    previous_month_start = dt.date(previous_month_end.year, previous_month_end.month, 1); previous_month_str = previous_month_start.strftime("%Y-%m")
-    logging.info(f"Calculating trends between {previous_month_str} and {current_month_str}")
-    spending_current: Dict[str, Decimal] = defaultdict(Decimal); spending_previous: Dict[str, Decimal] = defaultdict(Decimal)
-    all_categories_in_period = set()
-    for tx in valid_transactions:
-        if not isinstance(tx.date, dt.date): continue
-        net_op_spending_impact = Decimal('0.00')
-        category_lower = tx.category.lower() if isinstance(tx.category, str) else ""
-        amount = tx.amount; is_transfer_or_payment = category_lower in TRANSFER_CATEGORIES; is_income_category = category_lower in INCOME_CATEGORIES
-        is_likely_refund = amount > 0 and not is_income_category and not is_transfer_or_payment
-        if amount < 0 and not is_transfer_or_payment: net_op_spending_impact = abs(amount)
-        elif is_likely_refund: net_op_spending_impact = -amount
-        if net_op_spending_impact != Decimal('0.00'):
-            category_key = tx.category.title() if tx.category else "Uncategorized"
-            if previous_month_start <= tx.date <= previous_month_end: spending_previous[category_key] += net_op_spending_impact; all_categories_in_period.add(category_key)
-            elif current_month_start <= tx.date <= current_month_end: spending_current[category_key] += net_op_spending_impact; all_categories_in_period.add(category_key)
-    if not any(previous_month_start <= tx.date <= previous_month_end for tx in valid_transactions) or \
-       not any(current_month_start <= tx.date <= current_month_end for tx in valid_transactions):
-        logging.warning("Insufficient data spanning the required two full months."); return {"error": "Insufficient data: Less than two full months of spending data available."}
-    trends_list = []; quantize_decimal = Decimal("0.01")
-    for category in sorted(list(all_categories_in_period)):
-        prev_spend = max(Decimal('0.00'), spending_previous.get(category, Decimal('0.00'))).quantize(quantize_decimal, rounding=ROUND_HALF_UP)
-        curr_spend = max(Decimal('0.00'), spending_current.get(category, Decimal('0.00'))).quantize(quantize_decimal, rounding=ROUND_HALF_UP)
-        change_amount = curr_spend - prev_spend; change_percent = None
-        if prev_spend > 0: change_percent = float(round((change_amount / prev_spend) * 100, 1))
-        elif curr_spend > 0: change_percent = float('inf')
-        if prev_spend > 0 or curr_spend > 0: trends_list.append({"category": category, "current_month_spending": curr_spend, "previous_month_spending": prev_spend, "change_amount": change_amount, "change_percent": change_percent})
-    trends_list.sort(key=lambda x: x['category'])
-    logging.info(f"Calculated trends for {len(trends_list)} categories.")
-    return {"current_month": current_month_str, "previous_month": previous_month_str, "trends": trends_list}
-
-# (identify_recurring_transactions function remains the same)
-def identify_recurring_transactions(transactions: List[Transaction], min_occurrences: int = 3, days_tolerance: int = 3, amount_tolerance_percent: float = 5.0) -> List[Dict[str, Any]]:
-    # ... (recurring identification logic remains the same) ...
-    valid_transactions = _validate_transactions(transactions)
-    if not valid_transactions: return []
-    grouped: Dict[Tuple[str, bool], List[Tuple[dt.date, Decimal, str]]] = defaultdict(list)
-    for tx in valid_transactions:
-        if tx.category.lower() in TRANSFER_CATEGORIES: continue
-        cleaned_desc = _clean_description_for_rule(tx.description);
-        if not cleaned_desc: continue
-        is_income = tx.amount > 0; group_key = (cleaned_desc.lower(), is_income)
-        grouped[group_key].append((tx.date, tx.amount, tx.category))
-    recurring = []; quantize_decimal = Decimal("0.01")
-    for (desc_lower, is_income_group), tx_list in grouped.items():
-        if len(tx_list) < min_occurrences: continue
-        tx_list.sort(key=lambda x: x[0])
-        amounts = [item[1] for item in tx_list]; avg_amount = sum(amounts) / len(amounts)
-        if avg_amount == Decimal('0'): continue
-        amount_tolerance_value = abs(avg_amount * (Decimal(amount_tolerance_percent) / Decimal(100)))
-        if not all(abs(amount - avg_amount) <= amount_tolerance_value for amount in amounts): continue
-        dates = [item[0] for item in tx_list]; intervals = [(dates[i+1] - dates[i]).days for i in range(len(dates) - 1)]
-        if not intervals: continue
-        avg_interval = sum(intervals) / len(intervals); consistent_interval = True; monthly_avg = 30.437
-        if abs(avg_interval - monthly_avg) > days_tolerance * 2: consistent_interval = False
-        if consistent_interval:
-            if not all(abs(interval - avg_interval) <= days_tolerance for interval in intervals): consistent_interval = False
-        if consistent_interval:
-            categories = [item[2] for item in tx_list]; most_common_category = Counter(categories).most_common(1)[0][0]
-            display_description = desc_lower.title()
-            for tx in valid_transactions:
-                 if _clean_description_for_rule(tx.description).lower() == desc_lower: display_description = tx.description; break
-            recurring.append({"description": display_description, "category": most_common_category.title(), "average_amount": avg_amount.quantize(quantize_decimal, rounding=ROUND_HALF_UP), "count": len(tx_list), "dates": [d.isoformat() for d in dates], "estimated_interval_days": round(avg_interval, 1), "is_income": is_income_group})
-    recurring.sort(key=lambda x: (-x['count'], x['description']))
-    return recurring
-
-# (analyze_frequent_spending function remains the same)
-def analyze_frequent_spending(transactions: List[Transaction], start_date: Optional[dt.date] = None, end_date: Optional[dt.date] = None, min_frequency: int = 2) -> List[Dict[str, Any]]:
-    # ... (frequent spending analysis logic remains the same) ...
-    valid_transactions = _validate_transactions(transactions);
-    if not valid_transactions: return []
-    filtered_txs = []
-    if start_date or end_date:
-        for tx in valid_transactions:
-            if not isinstance(tx.date, dt.date): continue
-            if start_date and tx.date < start_date: continue
-            if end_date and tx.date > end_date: continue
-            filtered_txs.append(tx)
-        logging.info(f"Filtered down to {len(filtered_txs)} transactions for frequent spending analysis.")
-    else: filtered_txs = valid_transactions; logging.info(f"Analyzing {len(filtered_txs)} transactions for frequent spending.")
-    spending_groups: Dict[str, List[Tuple[Decimal, str, Optional[int]]]] = defaultdict(list)
-    for tx in filtered_txs:
-        if _is_operational_spending(tx):
-            group_key = tx.description.title() if isinstance(tx.description, str) else "Unknown Description"
-            category_val = tx.category if isinstance(tx.category, str) else "Uncategorized"
-            spending_groups[group_key].append((tx.amount, category_val, tx.id))
-    frequent_spending = []; quantize_decimal = Decimal("0.01")
-    for description, group_txs in spending_groups.items():
-        frequency = len(group_txs)
-        if frequency >= min_frequency:
-            total = sum(abs(item[0]) for item in group_txs); average = total / frequency
-            categories = [item[1] for item in group_txs]; valid_categories = [c for c in categories if c]
-            most_common_category = Counter(valid_categories).most_common(1)[0][0] if valid_categories else "Uncategorized"
-            transaction_ids = [item[2] for item in group_txs if item[2] is not None]
-            frequent_spending.append({"cleaned_description": description, "frequency": frequency, "total_spending": total.quantize(quantize_decimal, rounding=ROUND_HALF_UP), "average_spending": average.quantize(quantize_decimal, rounding=ROUND_HALF_UP), "most_common_category": most_common_category.title(), "transaction_ids": transaction_ids})
-    frequent_spending.sort(key=lambda x: (x['frequency'], x['total_spending']), reverse=True)
-    logging.info(f"Identified {len(frequent_spending)} frequent spending patterns (min_freq={min_frequency}).")
-    return frequent_spending
-
-
-# --- Change: Add Duplicate Recurring Detection ---
-def find_potential_duplicate_recurring(
-    recurring_transactions: List[Dict[str, Any]],
-    amount_similarity_percent: float = 10.0, # How close amounts need to be (%)
-    max_days_apart_in_month: int = 7 # Max days between potential duplicates within the same month
-) -> List[Dict[str, Any]]:
+# --- Monthly Spending Trends ---
+def calculate_monthly_spending_trends(transactions: Optional[List[Transaction]] = None,
+                                      start_date: Optional[dt.date] = None,
+                                      end_date: Optional[dt.date] = None) -> Dict[str, Any]:
     """
-    Analyzes a list of identified recurring transactions to find potential duplicates.
-
-    Args:
-        recurring_transactions: The output list from identify_recurring_transactions.
-        amount_similarity_percent: Maximum percentage difference allowed between amounts.
-        max_days_apart_in_month: Maximum number of days allowed between two occurrences
-                                 within the same calendar month to be flagged as potential duplicates.
-
-    Returns:
-        A list of dictionaries, each representing a group of potential duplicates:
-        [
-            {
-                "category": str,
-                "potential_duplicates": [
-                    # List of the original recurring transaction dicts that are potential duplicates
-                    { recurring_transaction_dict_1 },
-                    { recurring_transaction_dict_2 },
-                    ...
-                ],
-                "reason": "Multiple recurring items found in the same category with similar amounts."
-            }, ...
-        ]
+    Calculates month-over-month spending trends by category.
+    If transactions list is provided, uses it. Otherwise fetches from DB based on dates.
     """
-    potential_duplicates = []
-    # Group recurring items by category (lowercase for comparison)
-    grouped_by_category: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    trends = {
+        "start_date": None,
+        "end_date": None,
+        "monthly_spending": {}, # { 'YYYY-MM': {'category': Decimal(amount), ... , '__total__': Decimal(total)} }
+        "trend_comparison": None # { 'category': {'current': Dec, 'previous': Dec, 'change': Dec, 'percent_change': float} }
+    }
+    using_fetched_transactions = False
+    if transactions is None:
+        using_fetched_transactions = True
+        log.info("No transactions passed to trends calculation, fetching from DB.")
+        # Fetch transactions if not provided, default to last 6 months if no dates
+        today = dt.date.today()
+        if end_date is None:
+            end_date = today
+        if start_date is None:
+            start_date = end_date - relativedelta(months=6) + dt.timedelta(days=1) # Approx 6 months back
 
-    for item in recurring_transactions:
-        # Only check categories prone to duplicates and non-income items
-        category_lower = item['category'].lower()
-        if category_lower in DUPLICATE_CHECK_CATEGORIES and not item['is_income']:
-            grouped_by_category[category_lower].append(item)
+        trends["start_date"] = start_date.isoformat()
+        trends["end_date"] = end_date.isoformat()
+        # Import database locally to avoid potential circular dependency at module level
+        try:
+            import database as db
+            transactions = db.get_all_transactions(start_date=start_date.isoformat(), end_date=end_date.isoformat())
+        except ImportError:
+            log.error("Failed to import database module within trends function.")
+            return {"error": "Database module unavailable."}
+        except Exception as e:
+            log.error(f"Failed to fetch transactions for trends: {e}", exc_info=True)
+            return {"error": "Failed to fetch transaction data."}
 
-    # Analyze categories with multiple recurring items
-    for category_lower, items in grouped_by_category.items():
-        if len(items) > 1:
-            # Check for amount similarity between pairs within the category
-            checked_pairs = set() # Avoid checking pairs twice (a,b) and (b,a)
-            possible_group = [] # Store items that might belong to a duplicate group
-
-            for i in range(len(items)):
-                for j in range(i + 1, len(items)):
-                    item1 = items[i]
-                    item2 = items[j]
-                    pair_key = tuple(sorted((i, j))) # Unique key for the pair
-                    if pair_key in checked_pairs: continue
-                    checked_pairs.add(pair_key)
-
-                    # Check amount similarity
-                    avg1 = item1['average_amount']
-                    avg2 = item2['average_amount']
-                    # Avoid division by zero if an amount is zero
-                    if avg1 == 0 or avg2 == 0: continue
-
-                    amount_diff_percent = abs(avg1 - avg2) / max(abs(avg1), abs(avg2)) * 100
-                    if amount_diff_percent <= amount_similarity_percent:
-                        # Amounts are similar, check if dates overlap suspiciously
-                        # A simple check: do any dates occur within the same month and close together?
-                        dates1 = [dt.date.fromisoformat(d) for d in item1['dates']]
-                        dates2 = [dt.date.fromisoformat(d) for d in item2['dates']]
-                        found_suspicious_overlap = False
-                        for d1 in dates1:
-                            for d2 in dates2:
-                                if d1.year == d2.year and d1.month == d2.month:
-                                    if abs((d1 - d2).days) <= max_days_apart_in_month:
-                                        found_suspicious_overlap = True
-                                        break
-                            if found_suspicious_overlap: break
-
-                        if found_suspicious_overlap:
-                             # Add both items to the potential group if not already added
-                             if item1 not in possible_group: possible_group.append(item1)
-                             if item2 not in possible_group: possible_group.append(item2)
-                             logging.info(f"Potential duplicate found in category '{item1['category']}': '{item1['description']}' and '{item2['description']}' (Similar amount & close dates)")
+    # Ensure transactions is a list even if fetching failed or returned None
+    if not isinstance(transactions, list):
+        log.warning("Transaction data is not a list, cannot calculate trends.")
+        transactions = []
 
 
-            # If we found potential duplicates in this category group
-            if possible_group:
-                 potential_duplicates.append({
-                     "category": possible_group[0]['category'], # Use category from first item
-                     "potential_duplicates": possible_group,
-                     "reason": f"Found {len(possible_group)} recurring items in the '{possible_group[0]['category']}' category with similar average amounts and occurrences within {max_days_apart_in_month} days in the same month."
-                 })
+    if not transactions:
+        log.warning("No transactions available for trend calculation.")
+        # If we fetched transactions and got none, update the trend dates
+        if using_fetched_transactions:
+             trends["start_date"] = start_date.isoformat() if start_date else None
+             trends["end_date"] = end_date.isoformat() if end_date else None
+        return trends
 
-    logging.info(f"Identified {len(potential_duplicates)} groups of potential duplicate recurring transactions.")
-    return potential_duplicates
+    log.info(f"Calculating monthly trends for {len(transactions)} transactions.")
+
+    # Aggregate spending by month and category
+    monthly_data = defaultdict(lambda: defaultdict(Decimal))
+    operational_categories = ['Payments', 'Transfers', 'Ignore', 'Income'] # Exclude these from spending totals
+
+    for tx in transactions:
+        # Add checks for attributes existence
+        if not hasattr(tx, 'date') or tx.date is None or \
+           not hasattr(tx, 'amount') or tx.amount is None or \
+           not hasattr(tx, 'category'):
+            log.debug(f"Skipping trend calculation for transaction ID {getattr(tx, 'id', 'N/A')} due to missing attributes.")
+            continue
+
+        try:
+            amount_dec = Decimal(tx.amount)
+        except (InvalidOperation, TypeError):
+            log.warning(f"Skipping trend calculation for transaction ID {getattr(tx, 'id', 'N/A')} due to invalid amount type: {tx.amount}")
+            continue
+
+        if amount_dec >= 0: # Only consider spending (negative amounts)
+            continue
+        if tx.category in operational_categories: # Exclude non-spending categories
+             continue
+
+        month_year = get_month_year_str(tx.date)
+        category = tx.category if tx.category else 'Uncategorized'
+        # Add the absolute spending amount
+        monthly_data[month_year][category] += abs(amount_dec)
+        monthly_data[month_year]['__total__'] += abs(amount_dec) # Track total spending per month
+
+    # Sort months chronologically
+    sorted_months = sorted(monthly_data.keys())
+    trends["monthly_spending"] = {
+        month: {cat: str(val) for cat, val in data.items()} # Convert Decimals to strings
+        for month, data in monthly_data.items()
+    }
 
 
-# (Testing block remains the same, add test for duplicates)
-if __name__ == '__main__':
-    # ... (previous dummy data and tests) ...
-    import datetime as dt
-    from decimal import Decimal
-    import json
+    # Calculate comparison between the last two available months
+    if len(sorted_months) >= 2:
+        current_month = sorted_months[-1]
+        previous_month = sorted_months[-2]
+        log.info(f"Calculating trend comparison between {previous_month} and {current_month}.")
 
-    if 'Transaction' not in globals():
-        class Transaction:
-            def __init__(self, date, description, amount, category="Uncategorized", transaction_type=None, id=None, raw_description=None, **kwargs):
-                self.id=id; self.date=date; self.description=description; self.raw_description=raw_description
-                self.amount=Decimal(amount); self.category=category if category else "Uncategorized"; self.transaction_type=transaction_type
+        current_data = monthly_data[current_month]
+        previous_data = monthly_data[previous_month]
+        comparison = {}
+        all_categories = set(current_data.keys()) | set(previous_data.keys())
+        all_categories.discard('__total__') # Don't compare the total key directly here
 
-    # Dummy data specifically for duplicate testing
-    duplicate_test_data = [
-        # Spotify - Should be identified as recurring
-        Transaction(id=801, date=dt.date(2024, 1, 19), description="Spotify USA", amount=Decimal("-10.99"), category="Subscriptions"),
-        Transaction(id=802, date=dt.date(2024, 2, 19), description="Spotify USA", amount=Decimal("-10.99"), category="Subscriptions"),
-        Transaction(id=803, date=dt.date(2024, 3, 19), description="Spotify USA", amount=Decimal("-10.99"), category="Subscriptions"),
-        Transaction(id=804, date=dt.date(2024, 4, 19), description="Spotify USA", amount=Decimal("-10.99"), category="Subscriptions"),
+        for category in sorted(list(all_categories)): # Sort categories alphabetically
+            current_amount = current_data.get(category, Decimal('0'))
+            previous_amount = previous_data.get(category, Decimal('0'))
+            change = current_amount - previous_amount
+            percent_change = None
+            if previous_amount != 0:
+                try:
+                    # Calculate percentage change, handle potential division by zero if previous is tiny
+                    percent_change = float((change / previous_amount) * 100)
+                except (InvalidOperation, OverflowError):
+                     percent_change = None # Or set to infinity/large number if appropriate
 
-        # Duplicate Spotify? (Slightly different name, similar amount, close date in April)
-        Transaction(id=901, date=dt.date(2024, 1, 21), description="SPOTIFYAB", amount=Decimal("-10.71"), category="Subscriptions"),
-        Transaction(id=902, date=dt.date(2024, 2, 21), description="SPOTIFYAB", amount=Decimal("-10.71"), category="Subscriptions"),
-        Transaction(id=903, date=dt.date(2024, 3, 21), description="SPOTIFYAB", amount=Decimal("-10.71"), category="Subscriptions"),
-        Transaction(id=904, date=dt.date(2024, 4, 21), description="SPOTIFYAB", amount=Decimal("-10.71"), category="Subscriptions"), # Close to 804
+            comparison[category] = {
+                "current_amount": str(current_amount),
+                "previous_amount": str(previous_amount),
+                "change": str(change),
+                "percent_change": percent_change # Keep as float/None
+            }
 
-        # Another Subscription - different amount/timing
-        Transaction(id=1001, date=dt.date(2024, 1, 1), description="Cloud Storage", amount=Decimal("-5.00"), category="Subscriptions"),
-        Transaction(id=1002, date=dt.date(2024, 2, 1), description="Cloud Storage", amount=Decimal("-5.00"), category="Subscriptions"),
-        Transaction(id=1003, date=dt.date(2024, 3, 1), description="Cloud Storage", amount=Decimal("-5.00"), category="Subscriptions"),
-        Transaction(id=1004, date=dt.date(2024, 4, 1), description="Cloud Storage", amount=Decimal("-5.00"), category="Subscriptions"),
+        # Add overall total comparison
+        total_current = current_data.get('__total__', Decimal('0'))
+        total_previous = previous_data.get('__total__', Decimal('0'))
+        total_change = total_current - total_previous
+        total_percent_change = None
+        if total_previous != 0:
+             try:
+                 total_percent_change = float((total_change / total_previous) * 100)
+             except (InvalidOperation, OverflowError):
+                  total_percent_change = None
 
-        # Utility Bill - Recurring but not a duplicate candidate usually
-        Transaction(id=1101, date=dt.date(2024, 1, 5), description="Electric Bill", amount=Decimal("-90.00"), category="Utilities"),
-        Transaction(id=1102, date=dt.date(2024, 2, 5), description="Electric Bill", amount=Decimal("-95.00"), category="Utilities"),
-        Transaction(id=1103, date=dt.date(2024, 3, 5), description="Electric Bill", amount=Decimal("-88.00"), category="Utilities"),
-        Transaction(id=1104, date=dt.date(2024, 4, 5), description="Electric Bill", amount=Decimal("-92.00"), category="Utilities"),
+        trends["trend_comparison"] = {
+            "current_month_str": current_month,
+            "previous_month_str": previous_month,
+            "total_current_spending": str(total_current),
+            "total_previous_spending": str(total_previous),
+            "total_change": str(total_change),
+            "total_percent_change": total_percent_change,
+            "comparison": comparison
+        }
+    else:
+        log.warning("Not enough monthly data (requires at least 2 months) to calculate trends.")
+
+
+    log.info("Monthly spending trend calculation finished.")
+    return trends
+
+
+# --- Recurring Transactions ---
+def identify_recurring_transactions(transactions: List[Transaction],
+                                    min_occurrences: int = 3,
+                                    days_tolerance: int = 5,
+                                    amount_tolerance_percent: float = 10.0) -> Dict[str, List[Dict]]:
+    """
+    Identifies potential recurring transactions based on description similarity,
+    amount proximity, and date intervals.
+    """
+    log.info(f"Identifying recurring transactions (min: {min_occurrences}, days tol: {days_tolerance}, amount tol: {amount_tolerance_percent}%).")
+    if not transactions:
+        return {"recurring_groups": []} # Return structure expected by app.py
+
+    # Group transactions by a cleaned description key
+    # Using a simple lowercase version for now, could be more sophisticated
+    grouped_by_desc = defaultdict(list)
+    for tx in transactions:
+         # Ensure necessary attributes exist
+        if hasattr(tx, 'description') and tx.description and \
+           hasattr(tx, 'date') and tx.date and \
+           hasattr(tx, 'amount') and tx.amount is not None:
+            try:
+                # Basic cleaning: lowercase, remove leading/trailing spaces
+                clean_desc = tx.description.lower().strip()
+                # Maybe remove common prefixes/suffixes like TST*, SQ*, etc.? Needs careful rules.
+                grouped_by_desc[clean_desc].append(tx)
+            except Exception as e:
+                 log.warning(f"Skipping transaction ID {getattr(tx, 'id', 'N/A')} during grouping due to error: {e}")
+                 continue
+
+    potential_groups = []
+
+    # Analyze groups with enough potential occurrences
+    for desc, group_txs in grouped_by_desc.items():
+        if len(group_txs) < min_occurrences:
+            continue
+
+        # Sort transactions within the group by date
+        group_txs.sort(key=lambda t: t.date) # type: ignore
+
+        # Check for recurring patterns within the group
+        # This is a complex task. A simple approach: check intervals and amounts.
+        # Iterate through transactions and try to form sequences
+        # For simplicity, let's focus on amount similarity first
+        amount_groups = defaultdict(list)
+        for tx in group_txs:
+             # Group by amount within tolerance
+             matched_group = False
+             try:
+                 amount_dec = Decimal(tx.amount) # Ensure Decimal
+                 for base_amount_str in list(amount_groups.keys()): # Iterate over copies of keys
+                     base_amount = Decimal(base_amount_str) # Convert key back to Decimal
+                     tolerance = abs(base_amount * (Decimal(amount_tolerance_percent) / 100))
+                     if abs(amount_dec - base_amount) <= tolerance:
+                         amount_groups[base_amount_str].append(tx) # Use string key
+                         matched_group = True
+                         break
+                 if not matched_group:
+                     amount_groups[str(amount_dec)].append(tx) # Start a new amount group using string key
+             except (InvalidOperation, TypeError):
+                  log.warning(f"Skipping transaction ID {getattr(tx, 'id', 'N/A')} in amount grouping due to invalid amount: {tx.amount}")
+                  continue
+
+
+        # Now analyze sequences within each amount group for consistent intervals
+        for base_amount_str, amount_group_txs in amount_groups.items():
+            if len(amount_group_txs) < min_occurrences:
+                continue
+
+            base_amount = Decimal(base_amount_str) # Convert key back for logging/output
+
+            # Check date intervals (more complex logic needed here)
+            # Example: Calculate days between consecutive transactions
+            intervals = []
+            if len(amount_group_txs) > 1:
+                 for i in range(len(amount_group_txs) - 1):
+                     # Ensure dates are valid before calculating delta
+                     if amount_group_txs[i+1].date and amount_group_txs[i].date:
+                         delta = amount_group_txs[i+1].date - amount_group_txs[i].date # type: ignore
+                         intervals.append(delta.days)
+                     else:
+                          log.debug(f"Skipping interval calculation due to missing date in group: {desc}")
+
+
+            # Look for a common interval (e.g., monthly ~30 days, bi-weekly ~14 days)
+            # This requires more sophisticated analysis (e.g., clustering intervals)
+            # Simplified check: If most intervals are within tolerance of a common value (e.g., 30 +/- days_tolerance)
+            if not intervals: continue
+
+            interval_counts = Counter(intervals)
+            # Filter out potential outliers if needed
+            # Find the most frequent interval within the tolerance range
+            common_interval_found = None
+            max_count = 0
+
+            # Check common periods (weekly, bi-weekly, monthly, yearly)
+            possible_periods = [7, 14, 15, 30, 31, 28, 29, 365, 366] # Approximate days
+            best_fit_interval = None
+
+            for period in possible_periods:
+                current_count = 0
+                intervals_in_period = []
+                for interval, num in interval_counts.items():
+                    if abs(interval - period) <= days_tolerance:
+                        current_count += num
+                        intervals_in_period.append(interval)
+                if current_count >= min_occurrences - 1 and current_count > max_count: # Need N-1 intervals for N occurrences
+                     max_count = current_count
+                     # Calculate average of intervals close to the period
+                     if intervals_in_period:
+                          best_fit_interval = round(sum(intervals_in_period) / len(intervals_in_period))
+                     else: # Should not happen if current_count > 0 but as fallback
+                          best_fit_interval = period
+                     common_interval_found = True
+
+
+            if common_interval_found:
+                potential_groups.append({
+                    "description": desc,
+                    "category": amount_group_txs[0].category, # Assume category is consistent
+                    "average_amount": str(base_amount), # Use the base amount for the group
+                    "count": len(amount_group_txs),
+                    "interval_days": best_fit_interval, # Approximate interval
+                    "transactions": [t.to_dict() for t in amount_group_txs] # Include tx details
+                })
+
+    log.info(f"Identified {len(potential_groups)} potential recurring groups.")
+    # Sort groups perhaps by count or amount
+    potential_groups.sort(key=lambda g: g['count'], reverse=True)
+    return {"recurring_groups": potential_groups}
+
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    log.info("insights.py executed directly for testing.")
+
+    # Create some dummy transactions
+    # Use the Transaction class defined earlier in this file
+    test_transactions = [
+        Transaction(id=1, date=dt.date(2025, 1, 15), description="NETFLIX", amount=Decimal("-15.99"), category="Subscriptions"),
+        Transaction(id=2, date=dt.date(2025, 2, 14), description="NETFLIX", amount=Decimal("-15.99"), category="Subscriptions"),
+        Transaction(id=3, date=dt.date(2025, 3, 15), description="NETFLIX", amount=Decimal("-15.99"), category="Subscriptions"),
+        Transaction(id=4, date=dt.date(2025, 4, 15), description="NETFLIX", amount=Decimal("-16.05"), category="Subscriptions"), # Slight amount change
+        Transaction(id=5, date=dt.date(2025, 3, 1), description="Gym Membership", amount=Decimal("-40.00"), category="Health"),
+        Transaction(id=6, date=dt.date(2025, 4, 1), description="Gym Membership", amount=Decimal("-40.00"), category="Health"),
+        Transaction(id=7, date=dt.date(2025, 3, 7), description="Payroll", amount=Decimal("2000.00"), category="Income"),
+        Transaction(id=8, date=dt.date(2025, 3, 21), description="Payroll", amount=Decimal("2000.00"), category="Income"),
+        Transaction(id=9, date=dt.date(2025, 4, 7), description="Payroll", amount=Decimal("2050.00"), category="Income"), # Amount change
+        Transaction(id=10, date=dt.date(2025, 4, 10), description="Coffee Shop", amount=Decimal("-5.00"), category="Food"),
+        Transaction(id=11, date=dt.date(2025, 4, 17), description="Coffee Shop", amount=Decimal("-5.25"), category="Food"),
+        Transaction(id=12, date=dt.date(2025, 4, 24), description="Coffee Shop", amount=Decimal("-4.90"), category="Food"),
+        Transaction(id=13, date=dt.date(2025, 4, 5), description="Payment Received", amount=Decimal("500.00"), category="Payments"),
     ]
 
-    print("\n--- Identifying Recurring Transactions for Duplicate Check ---")
-    recurring_items = identify_recurring_transactions(duplicate_test_data)
-    print(f"Found {len(recurring_items)} recurring items:")
-    print(json.dumps(recurring_items, indent=2, default=str))
+    print("\n--- Testing Summary Insights ---")
+    summary = calculate_summary_insights(test_transactions)
+    import json # Need json for printing dict nicely
+    print(json.dumps(summary, indent=2))
 
+    print("\n--- Testing Monthly Trends ---")
+    trends = calculate_monthly_spending_trends(transactions=test_transactions)
+    print(json.dumps(trends, indent=2))
 
-    print("\n--- Finding Potential Duplicate Recurring Transactions ---")
-    duplicates = find_potential_duplicate_recurring(recurring_items)
-    print(f"Found {len(duplicates)} groups of potential duplicates:")
-    print(json.dumps(duplicates, indent=2, default=str))
+    print("\n--- Testing Recurring Transactions ---")
+    recurring = identify_recurring_transactions(test_transactions)
+    print(json.dumps(recurring, indent=2))
 
