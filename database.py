@@ -2,10 +2,11 @@ import sqlite3
 import logging
 import datetime as dt
 import json
-import re # Import regular expression module
+import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import List, Optional, Dict
+# Change: Import Union for type hinting
+from typing import List, Optional, Dict, Tuple, Union
 
 # Import Transaction class from parser
 from parser import Transaction # Assuming parser.py is correct and available
@@ -19,22 +20,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [D
 
 # --- Helper Function for Cleaning ---
 def _clean_description_for_rule(description: str) -> str:
-    """
-    Cleans a transaction description to create a more general key for user rules.
-    Removes common date patterns (MM/DD, MM/DD/YY(YY)) from the end and trims whitespace.
-    """
-    if not description:
-        return ""
-    # Regex: Optional whitespace (\s*), then MM/DD, optionally followed by /YY or /YYYY (\/\d{2,4})?,
-    # surrounded by optional whitespace, anchored to the end of the string ($).
-    # Also handle potential extra spaces before the date pattern.
-    # Example patterns to remove: " 04/27", " 04/27/2025 ", " 4/27 "
+    """Cleans a transaction description for rule matching."""
+    if not description: return ""
     cleaned = re.sub(r'\s+\d{1,2}/\d{1,2}(?:/\d{2,4})?\s*$', '', description)
-    # Remove trailing transaction/reference numbers if they follow common patterns (optional refinement)
-    # cleaned = re.sub(r'\s+\d+$', '', cleaned) # Remove trailing numbers
-    # cleaned = re.sub(r'\s+[a-zA-Z0-9]{8,}$', '', cleaned) # Remove long trailing alphanumeric codes
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned)
     return cleaned.strip()
-
 
 # --- Database Initialization ---
 # (init_db function remains the same)
@@ -64,9 +54,7 @@ def init_db(db_path: Path = DATABASE_FILE):
     except sqlite3.Error as e:
         logging.error(f"Database error during initialization: {e}", exc_info=True)
     finally:
-        if conn:
-            conn.close()
-            logging.info(f"Database connection closed after init.")
+        if conn: conn.close(); logging.info(f"Database connection closed after init.")
 
 # --- Database Operations ---
 # (add_transactions remains the same)
@@ -81,73 +69,105 @@ def add_transactions(transactions: List[Transaction], db_path: Path = DATABASE_F
     try:
         conn = sqlite3.connect(db_path, check_same_thread=False)
         cursor = conn.cursor()
-
         if clear_existing:
             logging.info("Executing DELETE FROM transactions...")
             cursor.execute("DELETE FROM transactions")
             logging.info("Cleared existing transactions from the database.")
-            if not transactions:
-                conn.commit()
-                logging.info("Committed clear operation (no new transactions to add).")
-                return
+            if not transactions: conn.commit(); logging.info("Committed clear operation."); return
 
         data_to_insert = []
-        valid_count = 0
-        skipped_count = 0
+        valid_count = 0; skipped_count = 0
         for tx in transactions:
             if not isinstance(tx.date, dt.date) or not isinstance(tx.amount, Decimal):
-                logging.warning(f"Skipping transaction due to invalid type: Date={type(tx.date)}, Amount={type(tx.amount)} | TX: {tx}")
-                skipped_count += 1
-                continue
+                logging.warning(f"Skipping transaction due to invalid type: {tx}"); skipped_count += 1; continue
             category_lower = tx.category.lower() if tx.category else None
             data_to_insert.append((
                 tx.date.isoformat(), str(tx.amount), tx.description, category_lower,
                 tx.transaction_type, tx.source_account_type, tx.source_filename, tx.raw_description
             ))
             valid_count += 1
-
         if skipped_count > 0: logging.warning(f"Skipped {skipped_count} transactions during preparation.")
-        if not data_to_insert:
-            logging.warning("No valid transactions found to insert after type checking.")
-            if clear_existing: conn.commit()
-            return
+        if not data_to_insert: logging.warning("No valid transactions found to insert."); return
 
         logging.info(f"Attempting to insert {len(data_to_insert)} valid transactions...")
         cursor.executemany('''
-            INSERT INTO transactions (
-                date, amount, description, category, transaction_type,
-                source_account_type, source_filename, raw_description
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO transactions (date, amount, description, category, transaction_type,
+            source_account_type, source_filename, raw_description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''', data_to_insert)
         logging.info(f"Insertion executed. Row count affected (approx): {cursor.rowcount}")
-        conn.commit()
-        logging.info(f"Committed {len(data_to_insert)} transactions successfully.")
-
+        conn.commit(); logging.info(f"Committed {len(data_to_insert)} transactions successfully.")
     except sqlite3.Error as e:
         logging.error(f"Database error adding transactions: {e}", exc_info=True)
         if conn: conn.rollback(); logging.info("Rolled back transaction due to error.")
     finally:
         if conn: conn.close(); logging.info("Database connection closed after add_transactions.")
 
+# --- Change: Update get_all_transactions to accept filters ---
+def get_all_transactions(
+    db_path: Path = DATABASE_FILE,
+    start_date: Optional[Union[str, dt.date]] = None,
+    end_date: Optional[Union[str, dt.date]] = None,
+    category: Optional[str] = None
+    # Future: Add min_amount, max_amount, description_contains etc.
+) -> List[Transaction]:
+    """
+    Retrieves transactions from the database, optionally filtering by date range and category.
 
-# (get_all_transactions remains the same)
-def get_all_transactions(db_path: Path = DATABASE_FILE) -> List[Transaction]:
-    """Retrieves all transactions from the database including their IDs."""
+    Args:
+        db_path: Path to the SQLite database file.
+        start_date: The start date (inclusive, YYYY-MM-DD string or date object).
+        end_date: The end date (inclusive, YYYY-MM-DD string or date object).
+        category: The category to filter by (case-insensitive).
+
+    Returns:
+        A list of Transaction objects matching the filters.
+    """
     transactions: List[Transaction] = []
     conn = None
+    # --- Build WHERE clause dynamically ---
+    where_clauses = []
+    params = []
+
+    # Date filtering (SQLite stores dates as TEXT YYYY-MM-DD)
+    if start_date:
+        start_date_str = start_date.isoformat() if isinstance(start_date, dt.date) else str(start_date)
+        where_clauses.append("date >= ?")
+        params.append(start_date_str)
+        logging.info(f"Filtering transactions from date: {start_date_str}")
+    if end_date:
+        end_date_str = end_date.isoformat() if isinstance(end_date, dt.date) else str(end_date)
+        where_clauses.append("date <= ?")
+        params.append(end_date_str)
+        logging.info(f"Filtering transactions up to date: {end_date_str}")
+
+    # Category filtering (case-insensitive on the stored lowercase category)
+    if category:
+        category_lower = category.strip().lower()
+        where_clauses.append("LOWER(category) = ?") # Compare lowercase in DB with lowercase input
+        params.append(category_lower)
+        logging.info(f"Filtering transactions by category (lowercase): {category_lower}")
+
+    # Combine WHERE clauses
+    sql_where = ""
+    if where_clauses:
+        sql_where = "WHERE " + " AND ".join(where_clauses)
+
+    # Construct the final SQL query
+    sql_query = f"SELECT id, date, description, amount, category, transaction_type, source_account_type, source_filename, raw_description FROM transactions {sql_where} ORDER BY date, id"
+    # --- End WHERE clause building ---
+
     logging.info(f"get_all_transactions called. Connecting to {db_path}")
+    logging.info(f"Executing SQL: {sql_query} with params: {params}")
     try:
         conn = sqlite3.connect(db_path, check_same_thread=False)
         cursor = conn.cursor()
 
-        logging.info("Executing SELECT FROM transactions...")
-        cursor.execute("SELECT id, date, description, amount, category, transaction_type, source_account_type, source_filename, raw_description FROM transactions ORDER BY date, id")
+        cursor.execute(sql_query, params) # Execute with parameters
         rows = cursor.fetchall()
-        logging.info(f"Fetched {len(rows)} rows from the database.")
+        logging.info(f"Fetched {len(rows)} rows from the database matching filters.")
         if not rows: return []
 
-        converted_count = 0
-        conversion_errors = 0
+        converted_count = 0; conversion_errors = 0
         for i, row in enumerate(rows):
             try:
                 (tx_id, date_str, description, amount_str, category_db, trans_type,
@@ -161,13 +181,13 @@ def get_all_transactions(db_path: Path = DATABASE_FILE) -> List[Transaction]:
                 transactions.append(transaction)
                 converted_count += 1
             except (ValueError, TypeError, InvalidOperation) as e:
-                logging.warning(f"Skipping row {i+1} (ID: {row[0] if row else 'N/A'}) due to data conversion error: {e} | Row: {row}")
+                logging.warning(f"Skipping row {i+1} (ID: {row[0] if row else 'N/A'}) due to conversion error: {e} | Row: {row}")
                 conversion_errors += 1
             except Exception as e:
-                 logging.error(f"Unexpected error converting row {i+1} (ID: {row[0] if row else 'N/A'}) to Transaction: {e} | Row: {row}")
+                 logging.error(f"Unexpected error converting row {i+1} (ID: {row[0] if row else 'N/A'}): {e} | Row: {row}")
                  conversion_errors += 1
 
-        logging.info(f"Successfully converted {converted_count} rows to Transaction objects.")
+        logging.info(f"Successfully converted {converted_count} rows.")
         if conversion_errors > 0: logging.warning(f"Encountered errors converting {conversion_errors} rows.")
 
     except sqlite3.Error as e:
@@ -180,111 +200,67 @@ def get_all_transactions(db_path: Path = DATABASE_FILE) -> List[Transaction]:
 # (update_transaction_category remains the same)
 def update_transaction_category(transaction_id: int, new_category: str, db_path: Path = DATABASE_FILE) -> bool:
     """Updates the category (stored lowercase) of a specific transaction."""
-    conn = None
-    success = False
+    conn = None; success = False
     category_lower = new_category.strip().lower()
-    if not category_lower:
-        logging.warning("Attempted to update category to an empty string. Update cancelled.")
-        return False
-
-    logging.info(f"Attempting to update category for transaction ID {transaction_id} to '{category_lower}' (lowercase) in {db_path}")
+    if not category_lower: logging.warning("Empty category update cancelled."); return False
+    logging.info(f"Attempting update for ID {transaction_id} to '{category_lower}' in {db_path}")
     try:
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        cursor = conn.cursor()
+        conn = sqlite3.connect(db_path, check_same_thread=False); cursor = conn.cursor()
         cursor.execute("UPDATE transactions SET category = ? WHERE id = ?", (category_lower, transaction_id))
-        if cursor.rowcount == 1:
-            conn.commit()
-            success = True
-            logging.info(f"Successfully updated category for transaction ID {transaction_id}.")
-        elif cursor.rowcount == 0:
-             logging.warning(f"No transaction found with ID {transaction_id}. Update failed.")
-        else:
-            logging.error(f"Unexpected number of rows affected ({cursor.rowcount}) for ID {transaction_id}. Rolling back.")
-            conn.rollback()
-    except sqlite3.Error as e:
-        logging.error(f"Database error updating category for ID {transaction_id}: {e}", exc_info=True)
-        if conn: conn.rollback()
+        if cursor.rowcount == 1: conn.commit(); success = True; logging.info(f"Success updating ID {transaction_id}.")
+        elif cursor.rowcount == 0: logging.warning(f"ID {transaction_id} not found. Update failed.")
+        else: logging.error(f"Unexpected rows affected ({cursor.rowcount}) for ID {transaction_id}. Rolling back."); conn.rollback()
+    except sqlite3.Error as e: logging.error(f"DB error updating ID {transaction_id}: {e}", exc_info=True);
     finally:
-        if conn: conn.close(); logging.info("Database connection closed after update_transaction_category.")
+        if conn: conn.close(); logging.info("DB connection closed after update_transaction_category.")
     return success
 
 # (load_user_rules remains the same)
 def load_user_rules(rules_path: Path = USER_RULES_FILE) -> Dict[str, str]:
     """Loads user-defined category rules from a JSON file."""
-    if not rules_path.exists():
-        logging.info(f"User rules file not found at {rules_path}. Returning empty ruleset.")
-        return {}
+    if not rules_path.exists(): logging.info(f"User rules file not found at {rules_path}."); return {}
     try:
-        with open(rules_path, 'r', encoding='utf-8') as f:
-            rules = json.load(f)
-            rules_lower = {k.lower(): v for k, v in rules.items()}
-            logging.info(f"Loaded {len(rules_lower)} user rules from {rules_path}.")
-            return rules_lower
-    except json.JSONDecodeError:
-        logging.error(f"Error decoding JSON from user rules file: {rules_path}. Returning empty ruleset.")
-        return {}
-    except Exception as e:
-        logging.error(f"Error loading user rules file {rules_path}: {e}", exc_info=True)
-        return {}
+        with open(rules_path, 'r', encoding='utf-8') as f: rules = json.load(f)
+        rules_lower = {k.lower(): v for k, v in rules.items()}
+        logging.info(f"Loaded {len(rules_lower)} user rules from {rules_path}.")
+        return rules_lower
+    except Exception as e: logging.error(f"Error loading user rules file {rules_path}: {e}", exc_info=True); return {}
 
-# --- Change: Update User Rule Saving ---
+# (save_user_rule remains the same)
 def save_user_rule(description: str, category: str, rules_path: Path = USER_RULES_FILE):
     """Adds or updates a rule in the user_rules.json file after cleaning the description."""
-    if not description or not category:
-        logging.warning("Attempted to save user rule with empty description or category. Aborting.")
-        return
-
-    # --- Change: Clean the description before using it as a key ---
+    if not description or not category: logging.warning("Empty description or category for user rule."); return
     cleaned_description = _clean_description_for_rule(description)
-    if not cleaned_description:
-        logging.warning(f"Description '{description}' resulted in empty string after cleaning. Cannot save rule.")
-        return
-
-    # Use cleaned, lowercased description as key; keep original category case for value
-    rule_key = cleaned_description.lower()
-    rule_value = category.strip() # Use the category exactly as provided by user
-
+    if not cleaned_description: logging.warning(f"Cleaned description is empty for '{description}'."); return
+    rule_key = cleaned_description.lower(); rule_value = category.strip()
     logging.info(f"Attempting to save user rule: '{rule_key}' -> '{rule_value}' to {rules_path}")
     try:
-        user_rules = load_user_rules(rules_path) # Loads with lowercase keys
-        user_rules[rule_key] = rule_value # Add/update rule
-
-        # Save back to the file
-        with open(rules_path, 'w', encoding='utf-8') as f:
-            json.dump(user_rules, f, indent=4, ensure_ascii=False)
+        user_rules = load_user_rules(rules_path)
+        user_rules[rule_key] = rule_value
+        with open(rules_path, 'w', encoding='utf-8') as f: json.dump(user_rules, f, indent=4, ensure_ascii=False)
         logging.info(f"Successfully saved user rule to {rules_path}.")
-
-    except Exception as e:
-        logging.error(f"Error saving user rule to {rules_path}: {e}", exc_info=True)
+    except Exception as e: logging.error(f"Error saving user rule to {rules_path}: {e}", exc_info=True)
 
 # (get_transaction_by_id remains the same)
 def get_transaction_by_id(transaction_id: int, db_path: Path = DATABASE_FILE) -> Optional[Transaction]:
     """Retrieves a single transaction by its ID."""
-    conn = None
-    transaction = None
+    conn = None; transaction = None
     logging.info(f"Attempting to fetch transaction ID {transaction_id} from {db_path}")
     try:
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        cursor = conn.cursor()
+        conn = sqlite3.connect(db_path, check_same_thread=False); cursor = conn.cursor()
         cursor.execute("SELECT id, date, description, amount, category, transaction_type, source_account_type, source_filename, raw_description FROM transactions WHERE id = ?", (transaction_id,))
         row = cursor.fetchone()
         if row:
             logging.info(f"Found transaction for ID {transaction_id}.")
             try:
-                (tx_id, date_str, description, amount_str, category_db, trans_type,
-                 acc_type, filename, raw_desc) = row
+                (tx_id, date_str, description, amount_str, category_db, trans_type, acc_type, filename, raw_desc) = row
                 transaction = Transaction(
-                    id=tx_id, date=dt.date.fromisoformat(date_str), description=description,
-                    amount=Decimal(amount_str), category=category_db if category_db else "Uncategorized",
-                    transaction_type=trans_type, source_account_type=acc_type,
-                    source_filename=filename, raw_description=raw_desc
-                )
-            except Exception as e:
-                 logging.error(f"Error converting row to Transaction for ID {transaction_id}: {e} | Row: {row}")
-        else:
-            logging.warning(f"No transaction found for ID {transaction_id}.")
-    except sqlite3.Error as e:
-        logging.error(f"Database error retrieving transaction ID {transaction_id}: {e}", exc_info=True)
+                    id=tx_id, date=dt.date.fromisoformat(date_str), description=description, amount=Decimal(amount_str),
+                    category=category_db if category_db else "Uncategorized", transaction_type=trans_type,
+                    source_account_type=acc_type, source_filename=filename, raw_description=raw_desc)
+            except Exception as e: logging.error(f"Error converting row to Transaction for ID {transaction_id}: {e} | Row: {row}")
+        else: logging.warning(f"No transaction found for ID {transaction_id}.")
+    except sqlite3.Error as e: logging.error(f"Database error retrieving transaction ID {transaction_id}: {e}", exc_info=True)
     finally:
         if conn: conn.close(); logging.info("Database connection closed after get_transaction_by_id.")
     return transaction
@@ -293,41 +269,25 @@ def get_transaction_by_id(transaction_id: int, db_path: Path = DATABASE_FILE) ->
 if __name__ == '__main__':
     # ... (rest of the testing code remains the same) ...
     print("Initializing Database...")
-    init_db() # Ensure DB and table exist
-
+    init_db()
     print("\nClearing any existing test data...")
     add_transactions([], clear_existing=True)
-
     print("\nCreating dummy transactions...")
-    dummy_txs = [
-        Transaction(date=dt.date(2024, 4, 1), description="Test Income 04/01", amount=Decimal("100.00"), category="Income", id=None),
-        Transaction(date=dt.date(2024, 4, 2), description="Test Spending 04/02/2024", amount=Decimal("-25.50"), category="Food", id=None),
-    ]
-    print("\nAdding dummy transactions...")
-    add_transactions(dummy_txs, clear_existing=True) # Add and clear
-
-    print("\nFetching transactions after adding...")
-    fetched_txs = get_all_transactions()
+    dummy_txs = [ Transaction(date=dt.date(2024, 4, 1), description="Test Income 04/01", amount=Decimal("100.00"), category="Income", id=None), Transaction(date=dt.date(2024, 4, 2), description="Test Spending 04/02/2024", amount=Decimal("-25.50"), category="Food", id=None), ]
+    print("\nAdding dummy transactions..."); add_transactions(dummy_txs, clear_existing=True)
+    print("\nFetching transactions after adding..."); fetched_txs = get_all_transactions()
     if fetched_txs:
-        print(f"Found {len(fetched_txs)} transactions:")
-        for tx in fetched_txs: print(tx)
-
-        # Test update and rule saving
-        tx_to_update = fetched_txs[1] # Get the second transaction (Test Spending)
-        print(f"\nAttempting to update transaction ID {tx_to_update.id} from '{tx_to_update.category}' to 'Dining Out'...")
-        update_success = update_transaction_category(tx_to_update.id, "Dining Out")
-        print(f"Update successful: {update_success}")
-
-        if update_success:
-             print(f"\nAttempting to save user rule for description '{tx_to_update.description}' -> 'Dining Out'")
-             # Manually call save_user_rule for testing (app.py does this automatically)
-             save_user_rule(tx_to_update.description, "Dining Out")
-             print(f"Check '{USER_RULES_FILE.name}' to verify the rule (key should be cleaned).")
-
-        print("\nFetching transactions after update...")
-        updated_txs = get_all_transactions()
-        print(f"Found {len(updated_txs)} transactions:")
-        for tx in updated_txs: print(tx)
-    else:
-        print("No transactions found to test.")
+        print(f"Found {len(fetched_txs)} transactions:"); [print(tx) for tx in fetched_txs]
+        # Test filtering
+        print("\nFetching filtered transactions (category=food)...")
+        food_txs = get_all_transactions(category="food")
+        print(f"Found {len(food_txs)} transactions:"); [print(tx) for tx in food_txs]
+        print("\nFetching filtered transactions (start_date=2024-04-02)...")
+        date_txs = get_all_transactions(start_date="2024-04-02")
+        print(f"Found {len(date_txs)} transactions:"); [print(tx) for tx in date_txs]
+        # Test update
+        tx_to_update = fetched_txs[1]; print(f"\nAttempting to update transaction ID {tx_to_update.id} from '{tx_to_update.category}' to 'Dining Out'..."); update_success = update_transaction_category(tx_to_update.id, "Dining Out"); print(f"Update successful: {update_success}")
+        if update_success: print(f"\nAttempting to save user rule for description '{tx_to_update.description}' -> 'Dining Out'"); save_user_rule(tx_to_update.description, "Dining Out"); print(f"Check '{USER_RULES_FILE.name}' to verify the rule.")
+        print("\nFetching transactions after update..."); updated_txs = get_all_transactions(); print(f"Found {len(updated_txs)} transactions:"); [print(tx) for tx in updated_txs]
+    else: print("No transactions found to test.")
 
