@@ -8,6 +8,10 @@ from decimal import Decimal, InvalidOperation
 import datetime as dt
 from typing import List, Dict, Optional, Tuple, Any # <--- Added Any import
 
+# --- Local Import ---
+# Import database functions needed for rules
+import database
+
 # Configure logging
 log = logging.getLogger('parser') # Use specific logger name
 log.setLevel(logging.INFO)
@@ -20,297 +24,235 @@ if not log.handlers:
 
 # --- Constants ---
 VENDOR_RULES_FILE = 'vendors.json'
-USER_RULES_FILE = 'user_rules.json'
-# --- ADDED LLM RULES FILE ---
-LLM_RULES_FILE = 'llm_rules.json'
-# --- END ADDITION ---
+# --- REMOVED JSON FILE CONSTANTS ---
+# USER_RULES_FILE = 'user_rules.json'
+# LLM_RULES_FILE = 'llm_rules.json'
 
 # --- Transaction Class Definition ---
 # (Ensure this matches the definition in database.py)
-class Transaction:
-    def __init__(self, id: int, date: dt.date, description: str, amount: Decimal,
-                 category: str, transaction_type: Optional[str] = None,
-                 source_account_type: Optional[str] = None,
-                 source_filename: Optional[str] = None,
-                 raw_description: Optional[str] = None):
-        self.id = id # Note: ID will be 0 initially, DB assigns final ID
-        self.date = date
-        self.description = description
-        self.amount = amount
-        self.category = category
-        self.transaction_type = transaction_type
-        self.source_account_type = source_account_type
-        self.source_filename = source_filename
-        self.raw_description = raw_description if raw_description else description # Fallback
+# Define here for standalone testing if needed, but prefer importing
+try:
+    from database import Transaction
+except ImportError:
+    log.warning("Could not import Transaction from database in parser. Defining placeholder.")
+    class Transaction:
+        def __init__(self, id: int = 0, user_id: int = 0, date: Optional[dt.date] = None, description: Optional[str] = None,
+                     amount: Optional[Decimal] = None, category: Optional[str] = None,
+                     transaction_type: Optional[str] = None, source_account_type: Optional[str] = None,
+                     source_filename: Optional[str] = None, raw_description: Optional[str] = None):
+            self.id = id
+            self.user_id = user_id
+            self.date = date
+            self.description = description
+            self.amount = amount
+            self.category = category
+            self.transaction_type = transaction_type
+            self.source_account_type = source_account_type
+            self.source_filename = source_filename
+            self.raw_description = raw_description if raw_description else description
 
-    # --- CORRECTED TYPE HINT ---
-    def to_dict(self) -> Dict[str, Any]:
-    # --- END CORRECTION ---
-        """Converts the Transaction object to a dictionary."""
-        return {
-            "id": self.id,
-            "date": self.date.isoformat() if self.date else None,
-            "description": self.description,
-            "amount": str(self.amount) if self.amount is not None else None, # Keep as string for JSON
-            "category": self.category,
-            "transaction_type": self.transaction_type,
-            "source_account_type": self.source_account_type,
-            "source_filename": self.source_filename,
-            "raw_description": self.raw_description
-        }
+        def to_dict(self) -> Dict[str, Any]:
+            return {
+                "id": self.id, "user_id": self.user_id,
+                "date": self.date.isoformat() if self.date else None,
+                "description": self.description,
+                "amount": str(self.amount) if self.amount is not None else None,
+                "category": self.category, "transaction_type": self.transaction_type,
+                "source_account_type": self.source_account_type,
+                "source_filename": self.source_filename,
+                "raw_description": self.raw_description
+            }
 
 # --- Rule Loading Functions ---
 
-def load_rules(filepath: str) -> Dict[str, str]:
-    """Loads categorization rules from a JSON file."""
+def load_vendor_rules(filepath: str) -> Dict[str, str]:
+    """Loads GLOBAL vendor categorization rules from a JSON file."""
     rules = {}
     if os.path.exists(filepath):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                # Handle empty file case
                 content = f.read()
                 if not content:
-                    log.warning(f"Rules file {filepath} is empty.")
+                    log.warning(f"Vendor rules file {filepath} is empty.")
                     return {}
                 rules = json.loads(content)
-            log.info(f"Successfully loaded {len(rules)} rules from {filepath}.")
+            log.info(f"Successfully loaded {len(rules)} vendor rules from {filepath}.")
         except json.JSONDecodeError:
             log.error(f"Error decoding JSON from {filepath}. File might be corrupt or invalid JSON.")
-            return {} # Return empty dict on error
+            return {}
         except Exception as e:
-            log.error(f"Error loading rules from {filepath}: {e}", exc_info=True)
-            return {} # Return empty dict on error
+            log.error(f"Error loading vendor rules from {filepath}: {e}", exc_info=True)
+            return {}
     else:
-        log.warning(f"Rules file not found: {filepath}. No rules loaded.")
+        log.warning(f"Vendor rules file not found: {filepath}. No vendor rules loaded.")
     # Ensure keys are lowercase for case-insensitive matching
     return {k.lower(): v for k, v in rules.items()}
 
-# Load rules once when the module is imported
-VENDOR_RULES = load_rules(VENDOR_RULES_FILE)
-USER_RULES = load_rules(USER_RULES_FILE)
-# --- Load LLM rules ---
-LLM_RULES = load_rules(LLM_RULES_FILE)
-# --- End Load ---
+# --- Load VENDOR rules once ---
+VENDOR_RULES = load_vendor_rules(VENDOR_RULES_FILE)
 
-def load_user_rules() -> Dict[str, str]:
-    """Loads user-specific rules, ensuring keys are lowercase."""
-    global USER_RULES # Modify the global variable
-    USER_RULES = load_rules(USER_RULES_FILE)
-    return USER_RULES
+# --- REMOVED Global USER_RULES and LLM_RULES dictionaries and loading functions ---
 
-# --- ADDED: Function to load LLM rules ---
-def load_llm_rules() -> Dict[str, str]:
-    """Loads LLM-inferred rules, ensuring keys are lowercase."""
-    global LLM_RULES # Modify the global variable
-    LLM_RULES = load_rules(LLM_RULES_FILE)
-    return LLM_RULES
-# --- END ADDITION ---
+# --- UPDATED Rule Saving Functions (Use Database) ---
 
-def add_user_rule(description_fragment: str, category: str):
-    """Adds or updates a user-specific rule and saves it to the file."""
-    global USER_RULES
+def add_user_rule(user_id: int, description_fragment: str, category: str):
+    """Adds or updates a user-specific rule IN THE DATABASE."""
     if not description_fragment or not category:
-        log.warning("Attempted to add user rule with empty description or category.")
-        return
-
-    # Use a simplified, lowercase version of the description fragment as the key
-    # For simplicity now, using the lowercase fragment directly
-    rule_key = description_fragment.lower().strip()
-
-    # Add/update the rule in memory
-    USER_RULES[rule_key] = category
-    log.info(f"Added/Updated user rule: '{rule_key}' -> '{category}'")
-
-    # Save the updated rules back to the file
-    try:
-        # Sort keys for consistent file output (optional)
-        sorted_rules = dict(sorted(USER_RULES.items()))
-        with open(USER_RULES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(sorted_rules, f, indent=4, ensure_ascii=False)
-        log.info(f"Successfully saved updated user rules to {USER_RULES_FILE}.")
-    except IOError as e:
-        log.error(f"Error saving user rules to {USER_RULES_FILE}: {e}", exc_info=True)
-    except Exception as e:
-        log.error(f"Unexpected error saving user rules: {e}", exc_info=True)
-
-# --- ADDED: Function to save LLM rules ---
-# Note: This saves rules one by one. For performance, batch saving might be better.
-def save_llm_rule(description_fragment: str, category: str):
-    """Adds or updates an LLM-inferred rule and saves it to the file."""
-    global LLM_RULES
-    if not description_fragment or not category:
-        log.warning("Attempted to add LLM rule with empty description or category.")
+        log.warning(f"Attempted to add user rule for user {user_id} with empty description or category.")
         return
 
     rule_key = description_fragment.lower().strip()
-
-    # Add/update the rule in memory
-    LLM_RULES[rule_key] = category
-    log.info(f"Added/Updated LLM rule: '{rule_key}' -> '{category}'")
-
-    # Save the updated rules back to the file
     try:
-        # Sort keys for consistent file output (optional)
-        sorted_rules = dict(sorted(LLM_RULES.items()))
-        with open(LLM_RULES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(sorted_rules, f, indent=4, ensure_ascii=False)
-        log.info(f"Successfully saved updated LLM rules to {LLM_RULES_FILE}.")
-    except IOError as e:
-        log.error(f"Error saving LLM rules to {LLM_RULES_FILE}: {e}", exc_info=True)
+        database.save_user_rule(user_id, rule_key, category)
+        # No need to update in-memory dict, it will be fetched next time
     except Exception as e:
-        log.error(f"Unexpected error saving LLM rules: {e}", exc_info=True)
-# --- END ADDITION ---
+        # Database function should log errors, but we can log here too
+        log.error(f"Failed to save user rule to database for user {user_id}: {e}", exc_info=True)
 
 
-# --- MODIFIED FUNCTION ---
-def clear_user_rules():
-    """Clears user-specific rules from memory ONLY. Does NOT delete the file."""
-    global USER_RULES
-    log.warning(f"Clearing user rules from memory (file {USER_RULES_FILE} will NOT be deleted).")
-    USER_RULES = {} # Clear in-memory rules
-    # The file user_rules.json is intentionally left untouched.
-    # It will be reloaded the next time load_user_rules() or load_rules(USER_RULES_FILE) is called,
-    # or if the application restarts.
-# --- END OF MODIFIED FUNCTION ---
+def save_llm_rule(user_id: int, description_fragment: str, category: str):
+    """Adds or updates an LLM-inferred rule IN THE DATABASE."""
+    if not description_fragment or not category:
+        log.warning(f"Attempted to add LLM rule for user {user_id} with empty description or category.")
+        return
+
+    rule_key = description_fragment.lower().strip()
+    try:
+        database.save_llm_rule(user_id, rule_key, category)
+         # No need to update in-memory dict
+    except Exception as e:
+        log.error(f"Failed to save LLM rule to database for user {user_id}: {e}", exc_info=True)
+
+# --- REMOVED clear_user_rules function (no longer needed for JSON) ---
 
 
-# --- Categorization Logic ---
-# --- UPDATED HIERARCHY ---
-def categorize_transaction(description: str) -> str:
+# --- Categorization Logic (User-Aware) ---
+# --- UPDATED HIERARCHY & DATABASE FETCH ---
+def categorize_transaction(user_id: int, description: str) -> str:
     """
     Categorizes a transaction based on description using the hierarchy:
-    1. User Rules
-    2. Vendor Rules
-    3. LLM Inferred Rules
+    1. User Rules (from DB)
+    2. Vendor Rules (from global VENDOR_RULES)
+    3. LLM Inferred Rules (from DB)
     """
     if not description:
         return 'Uncategorized'
 
     desc_lower = description.lower()
 
+    # --- Fetch user-specific rules from DB ---
+    user_rules = database.get_user_rules(user_id)
+    llm_rules = database.get_llm_rules(user_id)
+    # --- End Fetch ---
+
     # 1. Check User Rules First (Highest Priority)
-    sorted_user_keys = sorted(USER_RULES.keys(), key=len, reverse=True)
+    sorted_user_keys = sorted(user_rules.keys(), key=len, reverse=True)
     for key in sorted_user_keys:
         if key in desc_lower:
-            category = USER_RULES[key]
-            log.debug(f"Matched user rule '{key}' for description '{description}'. Category: {category}")
+            category = user_rules[key]
+            log.debug(f"User {user_id}: Matched user rule '{key}' for description '{description}'. Category: {category}")
             return category
 
     # 2. Check Vendor Rules (Middle Priority)
+    # VENDOR_RULES is already loaded globally
     sorted_vendor_keys = sorted(VENDOR_RULES.keys(), key=len, reverse=True)
     for key in sorted_vendor_keys:
         if key in desc_lower:
             category = VENDOR_RULES[key]
-            log.debug(f"Matched vendor rule '{key}' for description '{description}'. Category: {category}")
+            log.debug(f"User {user_id}: Matched vendor rule '{key}' for description '{description}'. Category: {category}")
             return category
 
     # 3. Check LLM Inferred Rules (Lowest Priority)
-    sorted_llm_keys = sorted(LLM_RULES.keys(), key=len, reverse=True)
+    sorted_llm_keys = sorted(llm_rules.keys(), key=len, reverse=True)
     for key in sorted_llm_keys:
         if key in desc_lower:
-            category = LLM_RULES[key]
-            log.debug(f"Matched LLM rule '{key}' for description '{description}'. Category: {category}")
+            category = llm_rules[key]
+            log.debug(f"User {user_id}: Matched LLM rule '{key}' for description '{description}'. Category: {category}")
             return category
     # --- END HIERARCHY UPDATE ---
 
     # 4. Default if no match
-    log.debug(f"No rule matched for description '{description}'. Defaulting to Uncategorized.")
+    log.debug(f"User {user_id}: No rule matched for description '{description}'. Defaulting to Uncategorized.")
     return 'Uncategorized'
 
 
-# --- CSV Parsing Functions ---
+# --- CSV Parsing Functions (User-Aware) ---
 
-def parse_chase_csv_common(filepath: str, account_type: str) -> List[Transaction]:
-    """Common logic for parsing Chase CSV files."""
+# --- UPDATED SIGNATURE ---
+def parse_chase_csv_common(user_id: int, filepath: str, account_type: str) -> List[Transaction]:
+    """Common logic for parsing Chase CSV files for a specific user."""
     transactions = []
     filename = os.path.basename(filepath)
-    log.info(f"Starting parsing for {account_type} file: {filename}")
+    log.info(f"User {user_id}: Starting parsing for {account_type} file: {filename}")
     try:
-        # Ensure rule sets are loaded before parsing starts
-        load_user_rules() # Reload user rules from file
-        # VENDOR_RULES and LLM_RULES are loaded at module import,
-        # but could be reloaded here if dynamic updates are expected during runtime without restart.
-        # load_llm_rules() # Uncomment if needed
+        # --- REMOVED rule loading calls here ---
+        # Rules are now fetched per transaction inside categorize_transaction
 
         with open(filepath, mode='r', encoding='utf-8') as csvfile:
-            # Use DictReader for easier column access by name
-            # Handle potential variations in header names
             reader = csv.DictReader(csvfile)
-            fieldnames_lower = [name.lower().strip() for name in reader.fieldnames or []]
+            # Check for empty file or missing headers
+            if not reader.fieldnames:
+                 log.error(f"User {user_id}: CSV file {filename} is empty or has no header row.")
+                 raise ValueError(f"Empty or headerless CSV file: {filename}")
 
-            # Define potential variations for required columns
+            fieldnames_lower = [name.lower().strip() for name in reader.fieldnames]
+
             date_cols = ['transaction date', 'posting date']
             desc_cols = ['description']
             amount_cols = ['amount']
 
-            # Find the actual column names used in this file
-            date_col = next((name for name in reader.fieldnames or [] if name.lower().strip() in date_cols), None)
-            desc_col = next((name for name in reader.fieldnames or [] if name.lower().strip() in desc_cols), None)
-            amount_col = next((name for name in reader.fieldnames or [] if name.lower().strip() in amount_cols), None)
-            type_col = next((name for name in reader.fieldnames or [] if name.lower().strip() == 'type'), None) # Optional type col
+            date_col = next((name for name in reader.fieldnames if name.lower().strip() in date_cols), None)
+            desc_col = next((name for name in reader.fieldnames if name.lower().strip() in desc_cols), None)
+            amount_col = next((name for name in reader.fieldnames if name.lower().strip() in amount_cols), None)
+            type_col = next((name for name in reader.fieldnames if name.lower().strip() == 'type'), None)
 
             if not all([date_col, desc_col, amount_col]):
                  missing = []
                  if not date_col: missing.append("Date ('Transaction Date' or 'Posting Date')")
                  if not desc_col: missing.append("Description")
                  if not amount_col: missing.append("Amount")
-                 log.error(f"CSV file {filename} is missing required columns: {', '.join(missing)}. Cannot parse.")
+                 log.error(f"User {user_id}: CSV file {filename} is missing required columns: {', '.join(missing)}. Cannot parse.")
                  raise ValueError(f"Missing required columns in {filename}: {', '.join(missing)}")
 
             for i, row in enumerate(reader):
                 try:
-                    # Extract data using the found column names
                     date_str = row.get(date_col)
                     raw_desc = row.get(desc_col, '').strip()
                     amount_str = row.get(amount_col, '0').strip()
 
                     if not date_str or not raw_desc:
-                        log.warning(f"Skipping row {i+1} in {filename} due to missing date or description.")
+                        log.warning(f"User {user_id}: Skipping row {i+1} in {filename} due to missing date or description.")
                         continue
 
-                    # Clean description (basic example: remove extra spaces)
                     description = ' '.join(raw_desc.split())
 
-                    # Parse date
                     try:
-                        # Chase format is usually MM/DD/YYYY
                         transaction_date = dt.datetime.strptime(date_str, '%m/%d/%Y').date()
                     except ValueError:
-                        log.warning(f"Skipping row {i+1} in {filename} due to invalid date format: {date_str}")
+                        log.warning(f"User {user_id}: Skipping row {i+1} in {filename} due to invalid date format: {date_str}")
                         continue
 
-                    # Parse amount
                     try:
                         amount = Decimal(amount_str)
                     except InvalidOperation:
-                        log.warning(f"Skipping row {i+1} in {filename} due to invalid amount: {amount_str}")
+                        log.warning(f"User {user_id}: Skipping row {i+1} in {filename} due to invalid amount: {amount_str}")
                         continue
 
-                    # Determine transaction type (simple version based on amount)
-                    transaction_type_detail = row.get(type_col) if type_col else None # Get detailed type if available
+                    transaction_type_detail = row.get(type_col) if type_col else None
                     if transaction_type_detail:
                         tx_type = transaction_type_detail.strip()
                     elif amount > 0:
-                        # Refine credit type based on description if possible
-                        if 'payment' in description.lower():
-                            tx_type = 'PAYMENT_RECEIVED'
-                        elif 'deposit' in description.lower():
-                            tx_type = 'DEPOSIT'
-                        else:
-                            tx_type = 'CREDIT'
+                        tx_type = 'PAYMENT_RECEIVED' if 'payment' in description.lower() else 'DEPOSIT' if 'deposit' in description.lower() else 'CREDIT'
                     else:
-                        # Refine debit type
-                        if 'withdraw' in description.lower():
-                            tx_type = 'WITHDRAWAL'
-                        else:
-                            tx_type = 'DEBIT'
+                        tx_type = 'WITHDRAWAL' if 'withdraw' in description.lower() else 'DEBIT'
 
-                    # Categorize using the updated hierarchy
-                    category = categorize_transaction(description)
+                    # --- Pass user_id to categorization ---
+                    category = categorize_transaction(user_id, description)
+                    # --- End Pass ---
 
-                    # Create Transaction object (ID 0, will be assigned by DB)
                     transactions.append(Transaction(
                         id=0,
+                        user_id=user_id, # Pass user_id to Transaction object
                         date=transaction_date,
                         description=description,
                         amount=amount,
@@ -321,38 +263,44 @@ def parse_chase_csv_common(filepath: str, account_type: str) -> List[Transaction
                         raw_description=raw_desc
                     ))
                 except Exception as row_error:
-                    log.error(f"Error processing row {i+1} in {filename}: {row_error}", exc_info=True)
-                    # Decide whether to skip the row or stop parsing
+                    log.error(f"User {user_id}: Error processing row {i+1} in {filename}: {row_error}", exc_info=True)
 
-        log.info(f"Finished parsing {filename}. Found {len(transactions)} transactions.")
+        log.info(f"User {user_id}: Finished parsing {filename}. Found {len(transactions)} transactions.")
         return transactions
 
     except FileNotFoundError:
-        log.error(f"File not found: {filepath}")
+        log.error(f"User {user_id}: File not found: {filepath}")
         return []
-    except ValueError as ve: # Catch specific errors like missing columns
-        log.error(f"Parsing error for {filename}: {ve}")
-        return [] # Return empty on critical format errors
+    except ValueError as ve:
+        log.error(f"User {user_id}: Parsing error for {filename}: {ve}")
+        return []
     except Exception as e:
-        log.error(f"Failed to parse {filepath}: {e}", exc_info=True)
+        log.error(f"User {user_id}: Failed to parse {filepath}: {e}", exc_info=True)
         return []
 
+# --- UPDATED SIGNATURES ---
+def parse_checking_csv(user_id: int, filepath: str) -> List[Transaction]:
+    """Parses a Chase checking account CSV file for a specific user."""
+    return parse_chase_csv_common(user_id, filepath, 'checking')
 
-def parse_checking_csv(filepath: str) -> List[Transaction]:
-    """Parses a Chase checking account CSV file."""
-    return parse_chase_csv_common(filepath, 'checking')
-
-def parse_credit_csv(filepath: str) -> List[Transaction]:
-    """Parses a Chase credit card CSV file."""
-    # Note: Credit card CSVs might have different column names or formats
-    # Adjust the 'parse_chase_csv_common' or create a specific function if needed
-    # Example differences: 'Posting Date' vs 'Transaction Date', sign of amount for payments
-    return parse_chase_csv_common(filepath, 'credit')
+def parse_credit_csv(user_id: int, filepath: str) -> List[Transaction]:
+    """Parses a Chase credit card CSV file for a specific user."""
+    return parse_chase_csv_common(user_id, filepath, 'credit')
+# --- END UPDATES ---
 
 
 # --- Example Usage (for testing parser.py directly) ---
 if __name__ == '__main__':
     log.info("parser.py executed directly for testing.")
+
+    # --- Requires database setup for testing now ---
+    log.warning("Direct execution of parser.py for testing now requires database interaction.")
+    log.warning("Ensure database is initialized and potentially create a test user.")
+
+    # Example: Assume a test user exists with ID 1
+    test_user_id = 1
+    # You might need to create this user first if running standalone
+    # database.create_user("parser_test", "test_password_hash") # Hashing done elsewhere
 
     # Create dummy data directory if it doesn't exist
     if not os.path.exists('data'):
@@ -360,83 +308,63 @@ if __name__ == '__main__':
 
     # --- Create Dummy CSV Files for Testing ---
     dummy_checking_path = 'data/dummy_checking.csv'
-    dummy_credit_path = 'data/dummy_credit.csv'
-
     checking_data = [
-        ['Transaction Date', 'Posting Date', 'Description', 'Amount', 'Type', 'Balance', 'Check or Slip No.'],
-        ['03/15/2025', '03/15/2025', 'PAYROLL DEPOSIT - COMPANY ABC', '2000.00', 'ACH_CREDIT', '5000.00', ''],
-        ['03/10/2025', '03/11/2025', 'GROCERY STORE PURCHASE', '-75.50', 'DEBIT_CARD', '3000.00', ''],
-        ['03/05/2025', '03/05/2025', 'Payment Thank You-Mobile', '-819.17', 'ACH_DEBIT', '3075.50', ''], # Payment TO credit card
-        ['INVALID_DATE', '03/01/2025', 'Test Invalid Date', '-10.00', 'DEBIT_CARD', '3894.67', ''],
-        ['03/01/2025', '03/01/2025', 'Test Invalid Amount', 'INVALID', 'DEBIT_CARD', '3904.67', '']
+        ['Transaction Date', 'Posting Date', 'Description', 'Amount', 'Type'],
+        ['03/15/2025', '03/15/2025', 'PAYROLL DEPOSIT - TEST CORP', '2000.00', 'ACH_CREDIT'],
+        ['03/10/2025', '03/11/2025', 'VENDOR RULE MART', '-75.50', 'DEBIT_CARD'],
+        ['03/05/2025', '03/05/2025', 'USER RULE PLACE', '-50.00', 'DEBIT_CARD'],
+        ['03/02/2025', '03/02/2025', 'LLM RULE CAFE', '-10.00', 'DEBIT_CARD'],
+        ['03/01/2025', '03/01/2025', 'SOMETHING UNKNOWN', '-25.00', 'DEBIT_CARD'],
     ]
-    credit_data = [
-         # Note: Chase credit often uses 'Posting Date' and positive amounts for payments received
-        ['Transaction Date', 'Posting Date', 'Description', 'Category', 'Type', 'Amount', 'Memo'],
-        ['04/10/2025', '04/11/2025', 'ONLINE PAYMENT - THANK YOU', 'Payment', 'Payment', '500.00', ''], # Payment received
-        ['04/08/2025', '04/09/2025', 'RESTAURANT XYZ', 'Food & Drink', 'Sale', '-65.20', ''],
-        ['04/05/2025', '04/06/2025', 'AMAZON PRIME VIDEO', 'Shopping', 'Sale', '-14.99', '']
-    ]
-
     try:
         with open(dummy_checking_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerows(checking_data)
-        with open(dummy_credit_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerows(credit_data)
-        log.info("Created dummy CSV files for testing.")
+        log.info("Created dummy checking CSV for testing.")
     except IOError as e:
-        log.error(f"Failed to create dummy CSV files: {e}")
+        log.error(f"Failed to create dummy checking CSV: {e}")
+
+    # --- Setup Dummy Rules in DB for Testing ---
+    try:
+        log.info(f"Setting up dummy rules for test user {test_user_id}")
+        # Clear existing rules for test user first
+        conn = database.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM user_rules WHERE user_id = ?", (test_user_id,))
+        cursor.execute("DELETE FROM llm_rules WHERE user_id = ?", (test_user_id,))
+        conn.commit()
+        database.close_db_connection(conn, "clear_test_rules")
+
+        # Add test rules
+        database.save_user_rule(test_user_id, "user rule place", "User Category")
+        database.save_llm_rule(test_user_id, "llm rule cafe", "LLM Category")
+        # Assume "vendor rule mart" exists in vendors.json -> "Vendor Category"
+        if "vendor rule mart" not in VENDOR_RULES:
+             log.warning("Test assumes 'vendor rule mart' exists in vendors.json")
+
+    except Exception as db_err:
+        log.error(f"Failed to set up dummy rules in DB for testing: {db_err}")
+
 
     # --- Test Parsing ---
-    print("\n--- Testing Checking Parser ---")
-    checking_tx = parse_checking_csv(dummy_checking_path)
+    print("\n--- Testing Checking Parser (User Aware) ---")
+    checking_tx = parse_checking_csv(test_user_id, dummy_checking_path)
     for tx in checking_tx:
         print(tx.to_dict())
+        # Expected categories: Income, Vendor Category, User Category, LLM Category, Uncategorized
 
-    print("\n--- Testing Credit Parser ---")
-    credit_tx = parse_credit_csv(dummy_credit_path)
-    for tx in credit_tx:
-        print(tx.to_dict())
-
-    # --- Test Rule Management ---
-    print("\n--- Testing Rule Management ---")
-    # Create dummy rule files if they don't exist
-    if not os.path.exists(USER_RULES_FILE):
-        with open(USER_RULES_FILE, 'w') as f: json.dump({"payment thank you-mobile": "Payments"}, f) # Add initial user rule
-    if not os.path.exists(LLM_RULES_FILE):
-        with open(LLM_RULES_FILE, 'w') as f: json.dump({"amazon prime video": "Subscriptions"}, f) # Add initial LLM rule
-
-    load_user_rules() # Load potentially existing rules
-    load_llm_rules()
-    print("Initial User Rules:", USER_RULES)
-    print("Initial LLM Rules:", LLM_RULES)
-    add_user_rule(" grocery store purchase ", "Groceries") # Test adding user rule
-    save_llm_rule(" restaurant xyz ", "Food") # Test adding LLM rule
-    print("User Rules after add:", USER_RULES)
-    print("LLM Rules after add:", LLM_RULES)
-
-    # Test categorization hierarchy
-    print("\n--- Testing Categorization Hierarchy ---")
-    print("Categorizing 'GROCERY STORE PURCHASE':", categorize_transaction('GROCERY STORE PURCHASE')) # Should use User Rule
-    print("Categorizing 'RESTAURANT XYZ':", categorize_transaction('RESTAURANT XYZ')) # Should use LLM Rule (if User/Vendor don't match)
-    print("Categorizing 'PAYROLL DEPOSIT - COMPANY ABC':", categorize_transaction('PAYROLL DEPOSIT - COMPANY ABC')) # Should use Vendor Rule (assuming 'payroll' is in vendors.json)
-    print("Categorizing 'Payment Thank You-Mobile':", categorize_transaction('Payment Thank You-Mobile')) # Should use initial User Rule
+    # --- Test Rule Addition (DB) ---
+    print("\n--- Testing Rule Addition (DB) ---")
+    add_user_rule(test_user_id, "something unknown", "New User Category")
+    print("Checking DB for new rule...")
+    rules = database.get_user_rules(test_user_id)
+    print("Current User Rules from DB:", rules)
 
 
-    # Test clearing rules (only memory now)
-    clear_user_rules()
-    print("\nUser Rules after clear (memory only):", USER_RULES)
-    load_user_rules() # Load back from file to show persistence
-    print("User Rules after reload from file:", USER_RULES)
-
-
-    # Clean up dummy files
+    # Clean up dummy file
     # try:
     #     if os.path.exists(dummy_checking_path): os.remove(dummy_checking_path)
-    #     if os.path.exists(dummy_credit_path): os.remove(dummy_credit_path)
-    #     log.info("Cleaned up dummy CSV files.")
+    #     log.info("Cleaned up dummy checking CSV.")
     # except OSError as e:
-    #     log.error(f"Error cleaning up dummy files: {e}")
+    #     log.error(f"Error cleaning up dummy file: {e}")
 

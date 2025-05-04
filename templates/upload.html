@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Files - SpendLens</title>
+    <style>
+        body { font-family: sans-serif; margin: 2em; }
+        .alert { padding: 1em; margin-bottom: 1em; border-radius: 5px; }
+        .alert-danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .alert-warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+        .alert-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .alert-info { background-color: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+        label { display: block; margin-bottom: 0.5em; }
+        input[type=file] { margin-bottom: 1em; }
+        input[type=submit] { padding: 0.7em 1.5em; background-color: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        input[type=submit]:hover { background-color: #0056b3; }
+    </style>
+</head>
+<body>
+    <h1>Upload CSV Files</h1>
+    <p>Upload new CSV files. This will replace any existing transaction data for your account.</p>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="post" enctype="multipart/form-data">
+      <div>
+          <label for="checking_file">Checking CSV:</label>
+          <input type="file" name="checking_file" id="checking_file">
+      </div>
+      <div>
+          <label for="credit_file">Credit Card CSV:</label>
+          <input type="file" name="credit_file" id="credit_file">
+      </div>
+      <br>
+      <div>
+          <input type="submit" value="Upload">
+      </div>
+    </form>
+    <hr>
+    <p><a href="{{ url_for('index') }}">Back to Home</a> | <a href="{{ url_for('logout') }}">Logout</a></p>
+</body>
+</html>

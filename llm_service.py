@@ -4,7 +4,7 @@ import logging
 from decimal import Decimal
 import datetime as dt # Already imported, good.
 from collections import Counter
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple # Added Tuple
 from dotenv import load_dotenv
 import random # For potential sampling
 import json # For parsing LLM response
@@ -271,38 +271,37 @@ Brief Summary:
     try:
         # Ensure model is not None before calling generate_content
         if model:
-            # --- Added logging before/after API call ---
             log.debug("Calling model.generate_content for summary...")
             response = model.generate_content(prompt)
             log.debug(f"Received response object for summary: {type(response)}")
-            # --- End added logging ---
 
             # Check response structure carefully
             if hasattr(response, 'text') and response.text:
                 generated_text = response.text.strip()
-                log.info("Successfully generated summary.")
+                refusal_phrases = ["cannot provide", "not available in the provided data", "don't have access", "unable to"]
+                if any(phrase in generated_text.lower() for phrase in refusal_phrases):
+                     log.warning(f"LLM Summary generation resulted in a refusal/cannot answer: {generated_text}")
+                else:
+                     log.info("Successfully generated summary.")
                 return generated_text
             elif response.prompt_feedback and response.prompt_feedback.block_reason:
                  block_reason = response.prompt_feedback.block_reason
                  log.error(f"Gemini response blocked. Reason: {block_reason}")
                  return f"Error: Could not generate summary because the request was blocked ({block_reason})."
             else:
-                # Log the full response if text is missing
                 log.error(f"Gemini response missing text or blocked without reason. Full response: {response}")
                 return "Error: Could not generate summary due to unexpected API response format."
         else:
-            # This case should theoretically be caught by earlier checks, but included for safety
             log.error("Model is None just before calling generate_content.")
             return "Error: LLM Model is unexpectedly unavailable."
 
     except Exception as e:
-        # Log the specific error during the API call
         log.error(f"Error calling Gemini API for summary: {e}", exc_info=True)
         return f"Error: Could not generate summary due to an API error ({type(e).__name__})."
 
 
 # --- LLM Q&A Function ---
-# --- MODIFIED FUNCTION SIGNATURE ---
+# --- MODIFIED RETURN TYPE ---
 def answer_financial_question(
     question: str,
     transactions: List[Transaction],
@@ -310,8 +309,9 @@ def answer_financial_question(
     start_date_str: Optional[str] = None,
     end_date_str: Optional[str] = None,
     pre_calculated_result: Optional[Decimal] = None # New argument
-    ) -> str:
-    # --- END OF MODIFIED SIGNATURE ---
+    ) -> Tuple[str, str]: # Return (answer_text, status)
+    # Status can be: 'success', 'blocked', 'error', 'cannot_answer'
+    # --- END OF MODIFIED RETURN TYPE ---
     """Uses the Gemini API to answer a specific financial question based on provided data."""
     global model, is_configured
     # Ensure model is configured (similar logic as generate_financial_summary)
@@ -319,7 +319,7 @@ def answer_financial_question(
         log.warning("Model not configured initially, attempting configuration for Q&A...")
         try:
             API_KEY = os.environ.get('GOOGLE_API_KEY')
-            if not API_KEY: log.error("GOOGLE_API_KEY still not found."); return "Error: LLM model could not be configured - API key missing."
+            if not API_KEY: log.error("GOOGLE_API_KEY still not found."); return "Error: LLM model could not be configured - API key missing.", "error"
             else:
                 log.info(f"Found GOOGLE_API_KEY starting with: {API_KEY[:4]}... in Q&A function.")
                 genai.configure(api_key=API_KEY)
@@ -328,20 +328,34 @@ def answer_financial_question(
                 # --- END OF CHANGE ---
                 is_configured = True
                 log.info(f"Gemini API configured successfully within Q&A function with model 'gemini-1.5-flash'.")
-        except Exception as e: log.error(f"Gemini configuration failed within Q&A function: {e}", exc_info=True); return f"Error: LLM model configuration failed ({type(e).__name__})."
+        except Exception as e: log.error(f"Gemini configuration failed within Q&A function: {e}", exc_info=True); return f"Error: LLM model configuration failed ({type(e).__name__}).", "error"
 
     if model is None:
         log.error("answer_financial_question called but model object is None.")
-        return "Error: LLM model is not available."
+        return "Error: LLM model is not available.", "error"
 
     # --- Get Current Date ---
     current_date = dt.date.today()
     current_date_str = current_date.isoformat()
     log.info(f"Current date for context: {current_date_str}")
 
-    # Format the available data for the prompt
+    # --- Determine if details are requested ---
+    details_requested = any(detail_word in question.lower() for detail_word in ["show transaction", "list transaction", "associated math", "details", "breakdown"])
+
+    # --- Conditionally format transaction list ---
+    formatted_transactions = "" # Initialize as empty
+    include_tx_list = pre_calculated_result is None or details_requested
+
+    if include_tx_list:
+        formatted_transactions = format_transactions_for_qa(transactions, start_date_str, end_date_str)
+        log.debug("Including transaction list in Q&A prompt.")
+    else:
+        formatted_transactions = "(Transaction list omitted as pre-calculated result is provided and details were not explicitly requested)"
+        log.debug("Omitting transaction list from Q&A prompt.")
+    # --- End conditional formatting ---
+
+    # Format the summary data
     formatted_summary = format_summary_for_qa(summary_data, start_date_str, end_date_str)
-    formatted_transactions = format_transactions_for_qa(transactions, start_date_str, end_date_str) # Pass dates
 
     # Determine the data scope description for the prompt
     data_scope_info = "the available data (defaulting to last ~2 years if no dates specified)"
@@ -351,90 +365,116 @@ def answer_financial_question(
 
     # --- Construct the Prompt incorporating pre-calculated result ---
     pre_calc_info = ""
+    formatted_pre_calc = "" # Initialize for potential use in prompt
+    pre_calc_is_spending = False # Flag to help with phrasing
     if pre_calculated_result is not None:
         # Format the pre-calculated result for the prompt
-        formatted_pre_calc = f"${pre_calculated_result:,.2f}"
-        pre_calc_info = f"A pre-calculated result for this query is available: {formatted_pre_calc}. Use this value directly in your answer."
-        log.info(f"Providing pre-calculated result to LLM: {formatted_pre_calc}")
+        formatted_pre_calc = f"${abs(pre_calculated_result):,.2f}" # Use absolute value for display
+        pre_calc_is_spending = pre_calculated_result < 0 # Check if it was spending
+        pre_calc_info = f"A pre-calculated result for the user's query is available: {formatted_pre_calc}."
+        log.info(f"Providing pre-calculated result to LLM: {formatted_pre_calc} (Original: {pre_calculated_result})")
     else:
-        pre_calc_info = "No pre-calculated result was provided for this query. You must analyze the data below."
+        pre_calc_info = "No pre-calculated result was provided for this query. You must analyze the data below if necessary."
         log.info("No pre-calculated result provided to LLM.")
 
-    prompt = f"""
-You are SpendLens, a helpful financial assistant.
-The current date is: {current_date_str}. Use this date ONLY to understand relative time references in the user's question (like 'this year', 'last month').
+    # --- UPDATED PROMPT LOGIC ---
+    prompt_lines = [
+        "You are SpendLens, a helpful financial assistant.",
+        f"The current date is: {current_date_str}. Use this date ONLY to understand relative time references in the user's question (like 'this year', 'last month').",
+        f"Answer the following user question based *only* on the provided financial data ({data_scope_info}) and the pre-calculated result (if provided). Do NOT use any external knowledge for financial calculations or information beyond the current date.",
+        f"\nPre-calculated Result Information:\n{pre_calc_info}"
+    ]
 
-Answer the following user question based *only* on the provided financial data ({data_scope_info}) and the pre-calculated result (if provided). Do NOT use any external knowledge for financial calculations or information beyond the current date.
+    # --- Simplified Prompt Instructions when Pre-calculated (and no details requested) ---
+    if pre_calculated_result is not None and not details_requested:
+        log.debug("Using simplified prompt for pre-calculated result.")
+        prompt_lines.append("\nInstructions:")
+        prompt_lines.append(f"- The user asked: \"{question}\"")
+        prompt_lines.append(f"- The pre-calculated answer based on their data is {formatted_pre_calc}.")
+        # Add phrasing guidance based on whether it was income or spending
+        if pre_calc_is_spending:
+             prompt_lines.append(f"- State this concisely, for example: 'You spent {formatted_pre_calc} on [Category/Period].'")
+        else: # Assume income or other positive value
+             prompt_lines.append(f"- State this concisely, for example: 'Total income for [Period] was {formatted_pre_calc}.'")
+        prompt_lines.append("- Do not add any extra analysis, commentary, or mention the calculation.")
 
-Pre-calculated Result Information:
-{pre_calc_info}
+    # --- Detailed Prompt Instructions (when no pre-calc or details requested) ---
+    else:
+        log.debug("Using detailed prompt for Q&A.")
+        prompt_lines.extend([
+            "\nAvailable Data:",
+            f"1. Summary Statistics: Provides overall figures for the period. **DO NOT use for questions about specific months/dates.**\n{formatted_summary}",
+            f"\n2. Transaction List: Contains individual transactions. **This list is only included below if NO pre-calculated result was provided OR if the user asked for details.**\n{formatted_transactions}",
+            "\nInstructions:",
+            f"- **PRIORITY:** If a pre-calculated result is provided ({formatted_pre_calc if pre_calculated_result is not None else 'N/A'}) AND the user DID NOT ask for details/breakdown, state that result directly and concisely.",
+            "    - If the pre-calculated result represents spending (negative original value), phrase it like 'You spent [positive amount] on [Category/Period]'.",
+            "    - If the pre-calculated result represents income (positive original value), phrase it like 'Total income for [Period] was [amount]'.",
+            "- **If a pre-calculated result IS provided AND the user DID ask for details/breakdown:** State the pre-calculated result first (phrased appropriately for spending/income), then list the relevant transactions from the Transaction List (if included above) that match the criteria used for the pre-calculation. If the transaction list was omitted, state the pre-calculated result and mention that details are not available in this view.",
+            "- **If NO pre-calculated result is provided:**",
+            "    - Base your answer strictly on the financial data provided above, primarily the Transaction List.",
+            "    - Use the current date ({current_date_str}) to interpret relative time references in the question.",
+            "    - **If the question asks for totals/amounts for specific dates, months, or categories:**",
+            "        - Calculate the requested total by summing the 'Amount' from relevant entries in the **Transaction List** ONLY.",
+            "        - Ensure you filter by the correct date range (derived from the question and current date) and category (if specified).",
+            "        - **INCOME CALCULATION:** When calculating 'income', sum only transactions where the category is EXACTLY 'Income'. **EXPLICITLY EXCLUDE transactions categorized as 'Payments', even if their amount is positive.**",
+            "        - **State ONLY the final calculated total.** Phrase spending as 'You spent [positive amount]' and income as 'Total income was [amount]'.",
+            "        - If no matching transactions are found in the list (respecting the category filter), state that clearly.",
+            "    - **DO NOT show calculation steps or list individual transactions unless specifically asked.**",
+            "- If the answer cannot be determined from the provided data, state that the information is not available in the provided data.",
+            "- Be concise."
+        ])
+    # --- End Prompt Logic ---
 
-Available Data (Use only if NO pre-calculated result is provided, or if the question asks for details NOT covered by the pre-calculation, like specific transaction descriptions):
-1. Summary Statistics: Provides overall figures for the period. **DO NOT use for questions about specific months/dates.**
-{formatted_summary}
+    prompt_lines.append(f"\nUser Question: {question}")
+    prompt_lines.append("\nAnswer:")
+    prompt = "\n".join(prompt_lines)
+    # log.debug(f"Final Q&A Prompt:\n{prompt}") # Uncomment to log full prompt if needed
 
-2. Transaction List: Contains individual transactions with dates, categories, and amounts. **USE THIS LIST if NO pre-calculated result is provided AND the question is about specific time periods or categories.**
-{formatted_transactions}
 
-Instructions:
-- **PRIORITY:** If a pre-calculated result is provided above, state that result directly and concisely as the answer to the user's question. Do not attempt to recalculate or analyze the data list further unless the user asks a follow-up question requiring specific details from the list.
-- **If NO pre-calculated result is provided:**
-    - Base your answer strictly on the financial data provided above, primarily the Transaction List.
-    - Use the current date ({current_date_str}) to interpret relative time references in the question.
-    - **If the question asks for totals/amounts for specific dates, months, or categories:**
-        - Calculate the requested total by summing the 'Amount' from relevant entries in the **Transaction List** ONLY.
-        - Ensure you filter by the correct date range (derived from the question and current date) and category (if specified).
-        - **INCOME CALCULATION:** When calculating 'income', sum only transactions where the category is EXACTLY 'Income'. **EXPLICITLY EXCLUDE transactions categorized as 'Payments', even if their amount is positive.**
-        - **State ONLY the final calculated total.** (e.g., "Total income last month was $1500.00.")
-        - If no matching transactions are found in the list (respecting the category filter), state that clearly. (e.g., "No 'Income' category transactions were found for last month in the provided data.")
-    - **DO NOT show calculation steps or list individual transactions unless specifically asked.**
-- If the answer cannot be determined from the provided data (even after checking the list when no pre-calculation is available), state that the information is not available in the provided data.
-- Be concise.
-
-User Question: {question}
-
-Answer:
-"""
-
-    log.info(f"Answering question with Gemini: '{question}' (Data scope: {data_scope_info}, Current Date Context: {current_date_str}, Pre-calc provided: {pre_calculated_result is not None})")
+    log.info(f"Answering question with Gemini: '{question}' (Data scope: {data_scope_info}, Current Date Context: {current_date_str}, Pre-calc provided: {pre_calculated_result is not None}, Including Tx List: {include_tx_list})")
     try:
         if model:
-             # --- Added logging before/after API call ---
             log.debug("Calling model.generate_content for Q&A...")
             response = model.generate_content(prompt) # Using the updated prompt
             log.debug(f"Received response object for Q&A: {type(response)}")
-            # --- End added logging ---
 
-            # Check response structure carefully
+            # --- UPDATED RESPONSE HANDLING ---
             if hasattr(response, 'text') and response.text:
                 generated_text = response.text.strip()
                 log.info("Successfully generated answer.")
-                return generated_text
+                # Check for common refusal phrases
+                refusal_phrases = ["cannot provide", "not available in the provided data", "don't have access", "unable to", "cannot be determined"]
+                if any(phrase in generated_text.lower() for phrase in refusal_phrases):
+                     log.warning(f"LLM Q&A resulted in a refusal/cannot answer: {generated_text}")
+                     return generated_text, "cannot_answer"
+                else:
+                    # Removed fallback check - rely on prompt instructions
+                    return generated_text, "success"
             elif response.prompt_feedback and response.prompt_feedback.block_reason:
                  block_reason = response.prompt_feedback.block_reason
+                 error_message = f"Error: Could not get answer because the request was blocked by the safety filter ({block_reason}). Please rephrase your question."
                  log.error(f"Gemini Q&A response blocked. Reason: {block_reason}")
-                 # Provide a user-friendly error message
-                 return f"Error: Could not get answer because the request was blocked by the safety filter ({block_reason}). Please rephrase your question."
-            # Handle cases where the response might be empty or lack candidates
+                 return error_message, "blocked" # Return specific status
             elif not response.candidates:
                  log.error(f"Gemini Q&A response missing candidates. Response: {response}")
-                 # Check for prompt feedback even if candidates are missing
-                 block_reason = "Unknown"
+                 block_reason_str = "Unknown"
                  if response.prompt_feedback and response.prompt_feedback.block_reason:
-                     block_reason = response.prompt_feedback.block_reason
-                 return f"Error: Could not get answer. The response was empty or blocked (Reason: {block_reason})."
+                     block_reason_str = response.prompt_feedback.block_reason
+                 error_message = f"Error: Could not get answer. The response was empty or blocked (Reason: {block_reason_str})."
+                 return error_message, "blocked" # Treat as blocked
             else:
-                 # Catch-all for other unexpected formats
+                 error_message = "Error: Could not get answer due to unexpected API response format."
                  log.error(f"Gemini Q&A response missing text or blocked without clear reason. Response: {response}")
-                 return "Error: Could not get answer due to unexpected API response format."
+                 return error_message, "error"
+            # --- END UPDATED RESPONSE HANDLING ---
         else:
             log.error("Model is None just before calling generate_content for Q&A.")
-            return "Error: LLM Model is unexpectedly unavailable."
+            return "Error: LLM Model is unexpectedly unavailable.", "error"
 
     except Exception as e:
-        # Log the specific error during the API call
+        error_message = f"Error: Could not get answer due to an API error ({type(e).__name__})."
         log.error(f"Error calling Gemini API for Q&A: {e}", exc_info=True)
-        return f"Error: Could not get answer due to an API error ({type(e).__name__})."
+        return error_message, "error"
 
 # --- MODIFIED FUNCTION: LLM Batch Category Suggestion ---
 def suggest_categories_for_transactions(
@@ -484,7 +524,6 @@ def suggest_categories_for_transactions(
                 amount_dec = Decimal(tx.amount)
                 desc_lower = tx.description.lower().strip()
                 if desc_lower not in unique_descriptions_to_process:
-                     # Use index for uniqueness in prompt if needed, but map back via desc_lower
                      unique_descriptions_to_process[desc_lower] = f"{i+1}. Description: \"{tx.description}\", Amount: {amount_dec:.2f}"
             except (InvalidOperation, TypeError):
                  log.warning(f"Skipping transaction ID {getattr(tx, 'id', 'N/A')} in batch prep due to invalid amount: {tx.amount}")
@@ -506,7 +545,6 @@ def suggest_categories_for_transactions(
     if existing_rules:
         example_count = 0
         prompt_lines.append("\nExample categorizations based on keywords:")
-        # Ensure existing_rules is not empty before sampling
         if existing_rules:
             sample_keys = random.sample(list(existing_rules.keys()), min(len(existing_rules), 5))
             for key in sample_keys:
@@ -535,7 +573,6 @@ def suggest_categories_for_transactions(
             # --- Improved JSON Extraction ---
             json_string = None
             try:
-                # Find the first '{' and the last '}'
                 start_index = llm_response_text.find('{')
                 end_index = llm_response_text.rfind('}')
                 if start_index != -1 and end_index != -1 and end_index > start_index:
@@ -543,75 +580,48 @@ def suggest_categories_for_transactions(
                     log.debug(f"Extracted potential JSON string:\n{json_string}")
                 else:
                     log.error("Could not find valid JSON object delimiters '{' and '}' in LLM response.")
-
-            except Exception as find_err:
-                 log.error(f"Error finding JSON delimiters: {find_err}")
+            except Exception as find_err: log.error(f"Error finding JSON delimiters: {find_err}")
 
             if json_string:
                 try:
                     suggestions = json.loads(json_string)
-
                     if isinstance(suggestions, dict):
-                        # Validate suggestions against valid categories
                         valid_suggestions_count = 0
                         for desc_key_from_llm, suggested_cat_raw in suggestions.items():
                             if not isinstance(desc_key_from_llm, str) or not isinstance(suggested_cat_raw, str):
-                                log.warning(f"Skipping invalid suggestion format in LLM response: key={desc_key_from_llm}, value={suggested_cat_raw}")
+                                log.warning(f"Skipping invalid suggestion format: key={desc_key_from_llm}, value={suggested_cat_raw}")
                                 continue
-
-                            # Normalize suggested category and check against valid list
                             suggested_cat_normalized = None
                             for valid_cat in valid_categories:
                                  if valid_cat.lower() == suggested_cat_raw.strip().lower():
-                                     suggested_cat_normalized = valid_cat # Use canonical capitalization
-                                     break
-
+                                     suggested_cat_normalized = valid_cat; break
                             if suggested_cat_normalized and suggested_cat_normalized != 'Uncategorized':
-                                 # --- Flexible Key Matching ---
-                                 # Normalize the key from LLM
                                  llm_key_normalized = desc_key_from_llm.lower().strip()
-                                 # Check if this normalized key exists in our original map
                                  if llm_key_normalized in unique_descriptions_to_process:
                                      suggested_rules[llm_key_normalized] = suggested_cat_normalized
                                      valid_suggestions_count += 1
                                      log.info(f"Matched LLM key '{llm_key_normalized}' to original description.")
                                  else:
-                                     # Fallback: Check if any original key is *contained within* the LLM key (less reliable)
                                      found_match = False
                                      for original_key in unique_descriptions_to_process.keys():
                                          if original_key in llm_key_normalized:
                                              suggested_rules[original_key] = suggested_cat_normalized
                                              valid_suggestions_count += 1
-                                             log.warning(f"Loosely matched LLM key '{llm_key_normalized}' to original description '{original_key}'.")
-                                             found_match = True
-                                             break # Take the first partial match
-                                     if not found_match:
-                                         log.warning(f"LLM returned suggestion for unknown/unmatchable description key: '{desc_key_from_llm}'. Skipping.")
-                                 # --- End Flexible Key Matching ---
-                            else:
-                                log.info(f"LLM suggested '{suggested_cat_raw}' (invalid or Uncategorized) for '{desc_key_from_llm}'. Skipping.")
-                        log.info(f"Successfully parsed and validated {valid_suggestions_count} suggestions from LLM batch response.")
-                    else:
-                        log.error(f"Extracted string was not parsed as a JSON dictionary: {json_string}")
+                                             log.warning(f"Loosely matched LLM key '{llm_key_normalized}' to original '{original_key}'.")
+                                             found_match = True; break
+                                     if not found_match: log.warning(f"LLM returned unknown key: '{desc_key_from_llm}'. Skipping.")
+                            else: log.info(f"LLM suggested invalid/Uncategorized '{suggested_cat_raw}' for '{desc_key_from_llm}'. Skipping.")
+                        log.info(f"Successfully parsed/validated {valid_suggestions_count} suggestions.")
+                    else: log.error(f"Extracted string not parsed as dict: {json_string}")
+                except json.JSONDecodeError as json_err: log.error(f"Failed JSON parse: {json_err}. String: {json_string}")
+                except Exception as parse_err: log.error(f"Error processing suggestions: {parse_err}", exc_info=True)
+            else: log.error("Could not extract JSON string from LLM response.")
 
-                except json.JSONDecodeError as json_err:
-                    log.error(f"Failed to parse extracted JSON string from LLM: {json_err}")
-                    log.error(f"Extracted JSON String: {json_string}")
-                except Exception as parse_err:
-                     log.error(f"Error processing LLM suggestions response: {parse_err}", exc_info=True)
-            else:
-                 log.error("Could not extract a JSON string from the LLM response.")
+        elif response.prompt_feedback and response.prompt_feedback.block_reason: log.warning(f"LLM batch suggestion blocked. Reason: {response.prompt_feedback.block_reason}")
+        else: log.warning(f"LLM batch suggestion failed. Unexpected response: {response}")
+    except Exception as e: log.error(f"Error calling Gemini API for batch suggestion: {e}", exc_info=True)
 
-
-        elif response.prompt_feedback and response.prompt_feedback.block_reason:
-             log.warning(f"LLM batch category suggestion blocked. Reason: {response.prompt_feedback.block_reason}")
-        else:
-             log.warning(f"LLM batch category suggestion failed. Unexpected response: {response}")
-
-    except Exception as e:
-        log.error(f"Error calling Gemini API for batch category suggestion: {e}", exc_info=True)
-
-    log.info(f"LLM batch category suggestion process finished. Returning {len(suggested_rules)} valid suggestions.")
+    log.info(f"LLM batch category suggestion finished. Returning {len(suggested_rules)} valid suggestions.")
     return suggested_rules
 # --- END OF MODIFIED FUNCTION ---
 
@@ -625,153 +635,46 @@ if __name__ == '__main__':
         log.warning("LLM not configured. Testing will be limited.")
 
     # Example Mock Data (using Decimal for amounts)
-    # Summary data structure matching format_data_for_llm expectations
-    mock_summary = {
-        'total_income': Decimal('5000.00'),
-        'total_operational_spending': Decimal('-3500.00'), # Spending is negative
-        'net_operational_flow': Decimal('1500.00'),
-        'total_transfers_and_payments': Decimal('-1000.00'), # Transfers/Payments negative
-        'net_change_all': Decimal('500.00'),
-        'spending_by_category': { # Spending categories have negative values
-            'Food': Decimal('-1200.00'),
-            'Shopping': Decimal('-800.00'),
-            'Utilities': Decimal('-500.00'),
-            'Rent': Decimal('-1000.00')
-        },
-        # Additional fields for format_summary_for_qa
-        'operational_income': Decimal('5000.00'),
-        'operational_spending': Decimal('-3500.00'),
-        'net_spending_by_category': { # Net spending is positive for sorting
-            'Food': Decimal('1200.00'),
-            'Shopping': Decimal('800.00'),
-            'Utilities': Decimal('500.00'),
-            'Rent': Decimal('1000.00')
-        },
-        'transaction_count': 100
-    }
-    # Trends data structure matching format_data_for_llm expectations
-    mock_trends = {
-         'current_month_str': 'April 2025',
-         'previous_month_str': 'March 2025',
-         'total_current_spending': Decimal('-3500.00'), # Negative
-         'total_previous_spending': Decimal('-3200.00'), # Negative
-         'total_change': Decimal('-300.00'), # Negative change means more spending
-         'total_percent_change': Decimal('-9.4'), # Negative change means more spending
-         'comparison': { # Spending amounts negative, change can be +/-
-            'Food': {'current_amount': Decimal('-1200.00'), 'previous_amount': Decimal('-1100.00'), 'change': Decimal('-100.00'), 'percent_change': Decimal('-9.1')},
-            'Shopping': {'current_amount': Decimal('-800.00'), 'previous_amount': Decimal('-900.00'), 'change': Decimal('100.00'), 'percent_change': Decimal('11.1')}, # Positive change means less spending
-            'Utilities': {'current_amount': Decimal('-500.00'), 'previous_amount': Decimal('-500.00'), 'change': Decimal('0.00'), 'percent_change': Decimal('0.0')},
-            'Rent': {'current_amount': Decimal('-1000.00'), 'previous_amount': Decimal('-700.00'), 'change': Decimal('-300.00'), 'percent_change': Decimal('-42.9')}
-         }
-    }
-    mock_start = "2025-04-01"
-    mock_end = "2025-04-30"
+    mock_summary = { 'total_income': Decimal('5000.00'), 'total_operational_spending': Decimal('-3500.00'), 'net_operational_flow': Decimal('1500.00'), 'total_transfers_and_payments': Decimal('-1000.00'), 'net_change_all': Decimal('500.00'), 'spending_by_category': { 'Food': Decimal('-1200.00'), 'Shopping': Decimal('-800.00'), 'Utilities': Decimal('-500.00'), 'Rent': Decimal('-1000.00') }, 'operational_income': Decimal('5000.00'), 'operational_spending': Decimal('-3500.00'), 'net_spending_by_category': { 'Food': Decimal('1200.00'), 'Shopping': Decimal('800.00'), 'Utilities': Decimal('500.00'), 'Rent': Decimal('1000.00') }, 'transaction_count': 100 }
+    mock_trends = { 'current_month_str': 'April 2025', 'previous_month_str': 'March 2025', 'total_current_spending': Decimal('-3500.00'), 'total_previous_spending': Decimal('-3200.00'), 'total_change': Decimal('-300.00'), 'total_percent_change': Decimal('-9.4'), 'comparison': { 'Food': {'current_amount': Decimal('-1200.00'), 'previous_amount': Decimal('-1100.00'), 'change': Decimal('-100.00'), 'percent_change': Decimal('-9.1')}, 'Shopping': {'current_amount': Decimal('-800.00'), 'previous_amount': Decimal('-900.00'), 'change': Decimal('100.00'), 'percent_change': Decimal('11.1')}, 'Utilities': {'current_amount': Decimal('-500.00'), 'previous_amount': Decimal('-500.00'), 'change': Decimal('0.00'), 'percent_change': Decimal('0.0')}, 'Rent': {'current_amount': Decimal('-1000.00'), 'previous_amount': Decimal('-700.00'), 'change': Decimal('-300.00'), 'percent_change': Decimal('-42.9')} } }
+    mock_start = "2025-04-01"; mock_end = "2025-04-30"
 
     print("\n--- Testing format_data_for_llm ---")
-    formatted_llm_data = format_data_for_llm(mock_summary, mock_trends, mock_start, mock_end)
-    print(formatted_llm_data)
+    formatted_llm_data = format_data_for_llm(mock_summary, mock_trends, mock_start, mock_end); print(formatted_llm_data)
 
-    # Only run generation if configured
     if is_configured and model:
         print("\n--- Testing LLM Summary Generation ---")
-        summary_text = generate_financial_summary(mock_summary, mock_trends, mock_start, mock_end)
-        print("\nGenerated Summary:")
-        print(summary_text) # This should print now
-    else:
-        print("\n--- Skipping LLM Summary Generation (Not Configured) ---")
-
+        summary_text = generate_financial_summary(mock_summary, mock_trends, mock_start, mock_end); print("\nGenerated Summary:"); print(summary_text)
+    else: print("\n--- Skipping LLM Summary Generation (Not Configured) ---")
 
     print("\n--- Testing LLM Q&A ---")
-    # --- FIX TYPE HINT WARNING ---
-    # Use the actual Transaction class defined in this file
-    qa_test_transactions = [
-        Transaction(id=1, date=dt.date(2025, 4, 5), description="Grocery Mart", amount=Decimal("-55.00"), category="Groceries"),
-        Transaction(id=2, date=dt.date(2025, 4, 10), description="Gas Station #1", amount=Decimal("-40.00"), category="Gas"),
-        Transaction(id=3, date=dt.date(2025, 4, 15), description="Salary April", amount=Decimal("1500.00"), category="Income"),
-        Transaction(id=4, date=dt.date(2025, 4, 20), description="Gas Station #1", amount=Decimal("-35.50"), category="Gas"),
-        Transaction(id=5, date=dt.date(2025, 3, 15), description="Salary March", amount=Decimal("1450.00"), category="Income"), # Add March income
-        Transaction(id=6, date=dt.date(2025, 3, 10), description="Restaurant", amount=Decimal("-60.00"), category="Food"), # Add March spending
-        Transaction(id=7, date=dt.date(2025, 3, 5), description="Payment Thank You-Mobile", amount=Decimal("819.17"), category="Payments"), # Add positive payment
-    ]
-    # --- END FIX ---
-    # Use mock_summary for Q&A testing as well, but it might not reflect the qa_test_transactions accurately
-    qa_summary_for_test = {
-         'operational_income': Decimal('2950.00'), # Sum of March + April Income ONLY
-         'operational_spending': Decimal('-190.50'), # Sum of March + April Spending
-         'net_operational_flow': Decimal('2759.50'),
-         'net_spending_by_category': {'Groceries': Decimal('55.00'), 'Gas': Decimal('75.50'), 'Food': Decimal('60.00')},
-         'transaction_count': 7 # Includes payment
-    }
+    qa_test_transactions = [ Transaction(id=1, date=dt.date(2025, 4, 5), description="Grocery Mart", amount=Decimal("-55.00"), category="Groceries"), Transaction(id=2, date=dt.date(2025, 4, 10), description="Gas Station #1", amount=Decimal("-40.00"), category="Gas"), Transaction(id=3, date=dt.date(2025, 4, 15), description="Salary April", amount=Decimal("1500.00"), category="Income"), Transaction(id=4, date=dt.date(2025, 4, 20), description="Gas Station #1", amount=Decimal("-35.50"), category="Gas"), Transaction(id=5, date=dt.date(2025, 3, 15), description="Salary March", amount=Decimal("1450.00"), category="Income"), Transaction(id=6, date=dt.date(2025, 3, 10), description="Restaurant", amount=Decimal("-60.00"), category="Food"), Transaction(id=7, date=dt.date(2025, 3, 5), description="Payment Thank You-Mobile", amount=Decimal("819.17"), category="Payments"), ]
+    qa_summary_for_test = { 'operational_income': Decimal('2950.00'), 'operational_spending': Decimal('-190.50'), 'net_operational_flow': Decimal('2759.50'), 'net_spending_by_category': {'Groceries': Decimal('55.00'), 'Gas': Decimal('75.50'), 'Food': Decimal('60.00')}, 'transaction_count': 7 }
 
-    # Only run Q&A if configured
     if is_configured and model:
-        # --- Test Case 1: Question where pre-calculation IS expected ---
         print("\n--- Test 1: Income March (Pre-calculated) ---")
-        question_march_income = "what is my income for march 2025"
-        # Simulate pre-calculation result from app.py
-        pre_calc_march_income = Decimal("1450.00") # Based on Transaction id=5
-        answer_march_income = answer_financial_question(
-            question_march_income,
-            qa_test_transactions,
-            qa_summary_for_test,
-            "2025-03-01", "2025-04-30",
-            pre_calculated_result=pre_calc_march_income # Pass the pre-calculated value
-        )
-        print(f"Q: {question_march_income}\nA: {answer_march_income}")
-        # Expected: Answer should directly state $1450.00
+        q1 = "what is my income for march 2025"; pre_calc1 = Decimal("1450.00"); ans1, stat1 = answer_financial_question(q1, qa_test_transactions, qa_summary_for_test, "2025-03-01", "2025-04-30", pre_calculated_result=pre_calc1); print(f"Q: {q1}\nA: {ans1} (Status: {stat1})")
 
-        # --- Test Case 2: Question where pre-calculation is NOT expected ---
+        print("\n--- Test 1b: Income March (Pre-calculated + Details) ---")
+        q1b = "what is my income for march 2025 and show transactions"; ans1b, stat1b = answer_financial_question(q1b, qa_test_transactions, qa_summary_for_test, "2025-03-01", "2025-04-30", pre_calculated_result=pre_calc1); print(f"Q: {q1b}\nA: {ans1b} (Status: {stat1b})")
+
         print("\n--- Test 2: Specific Transaction (No Pre-calculation) ---")
-        question_specific_tx = "What was the transaction on 2025-04-10?"
-        answer_specific_tx = answer_financial_question(
-            question_specific_tx,
-            qa_test_transactions,
-            qa_summary_for_test,
-            "2025-03-01", "2025-04-30",
-            pre_calculated_result=None # Simulate no pre-calculation
-        )
-        print(f"Q: {question_specific_tx}\nA: {answer_specific_tx}")
-        # Expected: LLM should analyze the list and describe the Gas Station transaction
+        q2 = "What was the transaction on 2025-04-10?"; ans2, stat2 = answer_financial_question(q2, qa_test_transactions, qa_summary_for_test, "2025-03-01", "2025-04-30", pre_calculated_result=None); print(f"Q: {q2}\nA: {ans2} (Status: {stat2})")
 
-        # --- Test Case 3: Question where pre-calculation IS expected (Spending) ---
         print("\n--- Test 3: Spending April (Pre-calculated) ---")
-        question_april_spending = "how much did i spend in april 2025"
-        # Simulate pre-calculation result from app.py (sum of negative amounts in April)
-        pre_calc_april_spending = Decimal("-55.00") + Decimal("-40.00") + Decimal("-35.50") # = -130.50
-        answer_april_spending = answer_financial_question(
-            question_april_spending,
-            qa_test_transactions,
-            qa_summary_for_test,
-            "2025-03-01", "2025-04-30",
-            pre_calculated_result=pre_calc_april_spending # Pass the pre-calculated value
-        )
-        print(f"Q: {question_april_spending}\nA: {answer_april_spending}")
-        # Expected: Answer should directly state -$130.50 (or maybe formatted nicely)
+        q3 = "how much did i spend in april 2025"; pre_calc3 = Decimal("-130.50"); ans3, stat3 = answer_financial_question(q3, qa_test_transactions, qa_summary_for_test, "2025-03-01", "2025-04-30", pre_calculated_result=pre_calc3); print(f"Q: {q3}\nA: {ans3} (Status: {stat3})")
 
-        # --- Test Case 4: LLM Category Suggestion (Batch) ---
+        # --- Test 3b: Spending Food April (Pre-calculated) ---
+        print("\n--- Test 3b: Spending Food April (Pre-calculated) ---")
+        q3b = "how much did i spend on food in april 2025?"; pre_calc3b = Decimal("-0.00"); # Example if no food spending in April
+        ans3b, stat3b = answer_financial_question(q3b, qa_test_transactions, qa_summary_for_test, "2025-03-01", "2025-04-30", pre_calculated_result=pre_calc3b); print(f"Q: {q3b}\nA: {ans3b} (Status: {stat3b})")
+
+
         print("\n--- Test 4: LLM Batch Category Suggestion ---")
-        # --- FIX TYPE HINT WARNING ---
-        uncategorized_tx = [
-             Transaction(id=100, date=dt.date(2025, 4, 1), description="SQC*SQ *MERCHANT CAFE", amount=Decimal("-12.50"), category="Uncategorized"),
-             Transaction(id=101, date=dt.date(2025, 4, 2), description="TST* LOCAL COFFEE SHOP", amount=Decimal("-4.75"), category="Uncategorized"),
-             Transaction(id=102, date=dt.date(2025, 4, 3), description="VENMO PAYMENT JANE DOE", amount=Decimal("-50.00"), category="Uncategorized"),
-             Transaction(id=103, date=dt.date(2025, 4, 4), description="PARKING GARAGE FEE", amount=Decimal("-15.00"), category="Uncategorized"),
-        ]
-        # --- END FIX ---
+        uncategorized_tx = [ Transaction(id=100, date=dt.date(2025, 4, 1), description="SQC*SQ *MERCHANT CAFE", amount=Decimal("-12.50"), category="Uncategorized"), Transaction(id=101, date=dt.date(2025, 4, 2), description="TST* LOCAL COFFEE SHOP", amount=Decimal("-4.75"), category="Uncategorized"), Transaction(id=102, date=dt.date(2025, 4, 3), description="VENMO PAYMENT JANE DOE", amount=Decimal("-50.00"), category="Uncategorized"), Transaction(id=103, date=dt.date(2025, 4, 4), description="PARKING GARAGE FEE", amount=Decimal("-15.00"), category="Uncategorized"), ]
         valid_cats = ["Food", "Coffee Shops", "Transfers", "Shopping", "Travel", "Automotive", "Utilities", "Rent", "Income", "Payments", "Uncategorized"]
-        # Provide some existing rules as context
         existing_context = {"starbucks": "Coffee Shops", "shell": "Gas", "venmo": "Transfers"}
+        suggested_rules_map = suggest_categories_for_transactions(uncategorized_tx, valid_cats, existing_context); print("Suggested Rules Map (description -> category):"); print(suggested_rules_map)
 
-        suggested_rules_map = suggest_categories_for_transactions(
-            transactions_to_categorize=uncategorized_tx,
-            valid_categories=valid_cats,
-            existing_rules=existing_context
-            # sample_size=2 # Optional: Test sampling - REMOVED sampling for batch test
-        )
-        print("Suggested Rules Map (description -> category):")
-        print(suggested_rules_map)
-        # Expected: Dictionary with suggestions like {'sqc*sq *merchant cafe': 'Food', 'tst* local coffee shop': 'Coffee Shops', ...}
-
-    else:
-        print("\n--- Skipping LLM Q&A / Suggestion Testing (Not Configured) ---")
+    else: print("\n--- Skipping LLM Q&A / Suggestion Testing (Not Configured) ---")
 
