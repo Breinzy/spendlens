@@ -1,15 +1,20 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-// Make sure './App.css' import is removed if the file was deleted
+import { useState } from "react";
+import reactLogo from "./assets/react.svg";
+import viteLogo from "/vite.svg";
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [count, setCount] = useState(0);
 
   return (
-    <>
-      {/* Container for logos */}
-      <div>
+    /* Full‑screen flex container to prove Tailwind is active */
+    <div className="flex min-h-screen flex-col items-center justify-center bg-slate-100">
+        <h1 className="text-5xl font-bold text-pink-500 underline bg-slate-200 p-4 rounded">
+  Tailwind is officially working 🎉
+</h1>
+
+
+      {/* Logo row */}
+      <div className="flex gap-6">
         <a href="https://vite.dev" target="_blank">
           <img src={viteLogo} className="logo" alt="Vite logo" />
         </a>
@@ -18,25 +23,23 @@ function App() {
         </a>
       </div>
 
-      {/* Added Tailwind test classes here */}
+      {/* Heading */}
       <h1 className="text-red-500 text-2xl p-4">Vite + React</h1>
 
-      {/* Card section */}
+      {/* Counter card */}
       <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
+        <button onClick={() => setCount((c) => c + 1)}>count is {count}</button>
         <p>
           Edit <code>src/App.tsx</code> and save to test HMR
         </p>
       </div>
 
-      {/* Footer text */}
+      {/* Footer */}
       <p className="read-the-docs">
         Click on the Vite and React logos to learn more
       </p>
-    </>
-  )
+    </div>
+  );
 }
 
-export default App
+export default App;
