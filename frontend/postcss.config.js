@@ -6,3 +6,4 @@ export default {
     autoprefixer: {}, // Autoprefixer is usually still needed
   },
 }
+

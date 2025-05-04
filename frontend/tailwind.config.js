@@ -18,3 +18,4 @@ export default {
   // Add any plugins here
   plugins: [],
 }
+
