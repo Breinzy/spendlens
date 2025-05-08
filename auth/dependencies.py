@@ -1,123 +1,106 @@
 # auth/dependencies.py
 import logging
-from typing import Dict, Any, Optional
-import httpx
-from cachetools import TTLCache
-from fastapi import Depends, HTTPException, status
+from typing import Dict, Any, Optional, Annotated # Added Annotated
+# import httpx # No longer needed for JWKS fetch here
+# from cachetools import TTLCache # No longer needed for JWKS fetch here
+from fastapi import Depends, HTTPException, status, Request # Request needed for app.state
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
-from jose.exceptions import JOSEError
+# from jose import JWTError, jwt # No longer needed for manual decoding
+# from jose.exceptions import JOSEError # No longer needed
+from supabase import Client as SupabaseClient # Import Supabase client
+from gotrue.errors import AuthApiError # Import Supabase auth error
 
-from config import settings  # Your existing config.py
-import database_supabase as db_supabase  # Your existing database_supabase.py
-from models_pydantic import UserPydantic  # Your existing models_pydantic.py
+# Project specific imports
+from config import settings
+import database_supabase as db_supabase
+from models_pydantic import UserPydantic
 
+# Configure logging
 log = logging.getLogger('auth_dependencies')
 log.setLevel(logging.INFO if not settings.DEBUG_MODE else logging.DEBUG)
 if not log.handlers:
     handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(name)s:%(funcName)s] - %(message)s')
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(name)s:%(module)s:%(funcName)s:%(lineno)d] - %(message)s')
     handler.setFormatter(formatter)
     log.addHandler(handler)
+    log.propagate = False
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
+# OAuth2 scheme pointing to the login endpoint
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token") # Path relative to frontend
 
-jwks_cache = TTLCache(maxsize=1, ttl=3600)
+# --- JWKS Fetching Removed ---
+# We will now rely on supabase-py client's internal handling
 
+# --- Dependency to get Supabase client from app.state ---
+# (Copied from auth_router.py - ensure it's consistent or move to a shared location)
+def get_supabase_client(request: Request) -> SupabaseClient:
+    """Dependency to get the Supabase client from app.state."""
+    supabase_client = getattr(request.app.state, 'supabase_client', None)
+    if supabase_client is None:
+        log.error("Supabase client not found in app.state. Ensure it's initialized at startup in api_main.py.")
+        # Use 503 Service Unavailable as the auth service depends on this client
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Authentication service client not available.")
+    return supabase_client
 
-async def fetch_jwks() -> Dict[str, Any]:
-    cached_jwks = jwks_cache.get("jwks")
-    if cached_jwks:
-        log.debug("Using cached JWKS.")
-        return cached_jwks
-
-    if not settings.SUPABASE_URL:
-        log.error("Supabase URL not configured, cannot fetch JWKS.")
-        raise HTTPException(status_code=500, detail="Authentication configuration error.")
-
-    jwks_url = f"{settings.SUPABASE_URL.removesuffix('/')}/auth/v1/jwks"
-    log.info(f"Fetching JWKS from: {jwks_url}")
-
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(jwks_url)
-            response.raise_for_status()
-            jwks = response.json()
-            jwks_cache["jwks"] = jwks
-            log.info("JWKS fetched and cached successfully.")
-            return jwks
-        except httpx.HTTPStatusError as e:
-            log.error(f"HTTP error fetching JWKS: {e.response.status_code} - {e.response.text}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                                detail="Could not fetch authentication keys.")
-        except Exception as e:
-            log.error(f"Unexpected error fetching JWKS: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                                detail="Error fetching authentication keys.")
-
-
-async def get_current_supabase_user(token: str = Depends(oauth2_scheme)) -> UserPydantic:
+# --- Rewritten Dependency using supabase.auth.get_user ---
+async def get_current_supabase_user(
+    # Use Annotated for modern dependency injection syntax
+    token: Annotated[str, Depends(oauth2_scheme)],
+    supabase: Annotated[SupabaseClient, Depends(get_supabase_client)] # Inject the client
+) -> UserPydantic:
+    """
+    Dependency function to validate the JWT token using supabase.auth.get_user()
+    and return the corresponding UserPydantic object from our database.
+    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    if not settings.SUPABASE_URL:
-        log.error("Supabase URL not configured for JWT validation.")
-        raise credentials_exception
-
+    log.debug("Attempting token validation via supabase.auth.get_user...")
     try:
-        jwks = await fetch_jwks()
-        if not jwks or "keys" not in jwks:
-            log.error("JWKS not available or invalid format.")
+        # Use the injected Supabase client to validate the token
+        # This method handles JWKS fetching and validation internally
+        auth_response = supabase.auth.get_user(token)
+        supabase_user = auth_response.user
+
+        # Check if user object and essential details are present
+        if not supabase_user or not supabase_user.id or not supabase_user.email:
+            log.warning("supabase.auth.get_user did not return a valid user object.")
             raise credentials_exception
 
-        unverified_header = jwt.get_unverified_header(token)
-        rsa_key = {}
-        for key_spec in jwks["keys"]:  # Renamed 'key' to 'key_spec' to avoid conflict
-            if key_spec["kid"] == unverified_header.get("kid"):
-                rsa_key = {
-                    "kty": key_spec["kty"], "kid": key_spec["kid"],
-                    "use": key_spec["use"], "n": key_spec["n"], "e": key_spec["e"]
-                }
-                break
-
-        if not rsa_key:
-            log.warning("Unable to find appropriate key in JWKS.")
-            raise credentials_exception
-
-        payload = jwt.decode(
-            token, rsa_key, algorithms=["RS256"],
-            audience="authenticated",
-            issuer=f"{settings.SUPABASE_URL.removesuffix('/')}/auth/v1"
-        )
-
-        user_id: Optional[str] = payload.get("sub")
-        user_email: Optional[str] = payload.get("email")
-
-        if user_id is None or user_email is None:
-            log.warning("User ID (sub) or email not found in JWT payload.")
-            raise credentials_exception
+        # --- User Profile Sync (Same as before) ---
+        user_id = str(supabase_user.id)
+        user_email = str(supabase_user.email)
 
         user_profile = db_supabase.get_user_profile_by_id(user_id)
         if user_profile is None:
-            log.info(f"No local profile for valid JWT user {user_id}. Creating one.")
-            user_profile = db_supabase.create_user_profile(user_id,
-                                                           user_email)  # Ensure this returns the created profile or None
+            log.info(f"No local profile for valid Supabase user {user_id}. Creating one.")
+            user_profile = db_supabase.create_user_profile(user_id, user_email)
             if user_profile is None:
-                log.error(f"Failed to create local profile for valid JWT user {user_id}.")
+                log.error(f"Failed to create local profile for valid Supabase user {user_id}.")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                                    detail="User profile creation failed after authentication.")
+                                    detail="User profile synchronization failed after authentication.")
 
-        log.info(f"User {user_profile.username} (ID: {user_profile.id}) authenticated successfully via JWT.")
-        return UserPydantic(id=str(user_profile.id), email=user_profile.email, username=user_profile.username)
+        # --- Success ---
+        log.info(f"User {user_profile.username} (ID: {user_profile.id}) authenticated successfully via supabase.auth.get_user.")
+        return UserPydantic(id=user_profile.id, email=user_profile.email, username=user_profile.username)
 
-    except JWTError as e:
-        log.warning(f"JWTError during token validation: {str(e)}", exc_info=True)
-        raise credentials_exception
-    except JOSEError as e:
-        log.warning(f"JOSEError during token validation: {str(e)}", exc_info=True)
-        raise credentials_exception
-    except Exception as e:
-        log.error(f"Unexpected error during token validation: {str(e)}", exc_info=True)
-        raise credentials_exception
+    # --- Error Handling ---
+    except AuthApiError as e:
+        # Catch specific errors from supabase-py auth methods
+        log.warning(f"Supabase AuthApiError during token validation: {e.message} (Status: {e.status})")
+        # Map common Supabase errors to 401
+        if e.status == 401 or e.status == 403 or "invalid" in e.message.lower() or "expired" in e.message.lower():
+             raise credentials_exception from e
+        else: # Treat other Supabase errors as internal server errors for now
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                 detail=f"Authentication service error: {e.message}") from e
+    except HTTPException as e: # Re-raise HTTPExceptions (e.g., from get_supabase_client)
+        log.warning(f"HTTPException during dependency execution: {e.status_code} - {e.detail}")
+        raise e
+    except Exception as e: # Catch any other unexpected errors
+        log.error(f"Unexpected error during token validation via supabase.auth.get_user: {str(e)}", exc_info=True)
+        raise credentials_exception from e
+
