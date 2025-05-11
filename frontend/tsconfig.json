@@ -1,5 +1,17 @@
 {
-  "files": [],
+  // Add compilerOptions here specifically for shadcn-cli alias detection
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      // Adjust the path if your source directory is not "./src/"
+      "@/*": ["./src/*"]
+    }
+    // Other compiler options might not be needed here if they are
+    // correctly handled by the referenced files during the actual build.
+    // Add essential ones like "jsx": "react-jsx" if the CLI complains further.
+  },
+  // Keep the references for the actual build process
+  "files": [], // Typically empty when using references
   "references": [
     { "path": "./tsconfig.app.json" },
     { "path": "./tsconfig.node.json" }
